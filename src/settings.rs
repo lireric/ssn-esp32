@@ -7,6 +7,8 @@ use std::fmt;
 #[derive(Serialize, Deserialize, Debug, Encode, Decode, Clone)]
 
 pub struct Config {
+    pub account: String,
+    pub object: String,
     pub mqtt_host: String,
     pub mqtt_user: String,
     pub mqtt_pass: String,
@@ -18,6 +20,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            account: "2".to_string(),
+            object: "esp32-test".to_string(),
             mqtt_host: "192.168.1.105".to_string(),
             mqtt_user: "mosquitto".to_string(),
             mqtt_pass: "test".to_string(),
@@ -40,6 +44,8 @@ impl fmt::Display for Config {
         }
 
         // Add each field to the HTML
+        add_field!(account);
+        add_field!(object);
         add_field!(mqtt_host);
         add_field!(mqtt_user);
         add_field!(mqtt_pass);
