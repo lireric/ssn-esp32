@@ -38,6 +38,8 @@ serde = { version = "1.0", features = ["derive"] }
 bincode = { version = "=2.0.1" } # For binary serialization
 smart-leds = "*"
 ws2812-esp32-rmt-driver = { version = "0.12.0", features = ["smart-leds-trait"] }
+serde_json = "1.0"
+regex = "1.5"
 
 # [dependencies.smart-leds-trait]
 # optional = true
