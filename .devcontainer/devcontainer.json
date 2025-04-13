@@ -1,7 +1,8 @@
 {
   "name": "ssn_esp32",
   // Select between image and build propieties to pull or build the image.
-  "image": "docker.io/espressif/idf-rust:all_latest",
+//  "image": "docker.io/espressif/idf-rust:all_latest",
+  "image": "vsc-ssn-esp32",
   // "build": {
   //   "dockerfile": "Dockerfile",
   //   "args": {

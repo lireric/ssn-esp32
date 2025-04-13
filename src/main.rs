@@ -1,11 +1,17 @@
 // #![cfg(feature = "smart-leds-trait")]
 use anyhow::{Context, Result};
 use core::str;
+use embedded_hal::i2c::ErrorType;
+use embedded_hal::i2c::I2c;
+use embedded_hal_compat::ReverseCompat;
+
 use embedded_svc::mqtt::client::{
     Details::Complete, EventPayload::Error, EventPayload::Received, QoS,
 };
 use embedded_svc::{http::Method, io::Write};
-use esp_idf_hal::delay::FreeRtos; // For delay functionality
+use ens160::Ens160Error;
+
+use esp_idf_hal::delay::{Ets, FreeRtos}; // For delay functionality
 use esp_idf_hal::gpio::{ADCPin, Gpio0, Gpio1, Gpio2, Gpio3, Gpio4, Gpio5, Output, PinDriver}; // For GPIO control
 use esp_idf_hal::prelude::*; // For peripheral access
 use esp_idf_svc::hal::adc::oneshot::AdcDriver;
@@ -14,7 +20,7 @@ use esp_idf_svc::{
     hal::{
         adc::ADC1,
         delay,
-        i2c::{I2cConfig, I2cDriver},
+        i2c::{I2cConfig, I2cDriver, I2cError},
         io::EspIOError,
         prelude::*,
     },
@@ -37,10 +43,12 @@ use commons::ValuesDev;
 mod mqtt_messages;
 mod wifi;
 use bincode::{config, Decode, Encode};
-use esp_idf_hal::i2c::I2cError;
+// use esp_idf_hal::i2c::I2cError;
 use serde::{Deserialize, Serialize};
 mod settings;
 use log::{info, warn};
+
+use lazy_static::lazy_static;
 
 use ws2812_esp32_rmt_driver::driver::color::{LedPixelColor, LedPixelColorGrb24};
 use ws2812_esp32_rmt_driver::driver::Ws2812Esp32RmtDriver;
@@ -52,8 +60,62 @@ mod adc_reader;
 use adc_reader::AdcReader;
 use esp_idf_hal::gpio::AnyIOPin;
 
+mod ens160;
+use ens160::ENS160Sensor;
+
 // if sensor value is not changed in this period mqtt message will by sended anyway
 const MAX_PERIOD_REFRESH_MQTT: u64 = 20;
+
+lazy_static! {
+    // static ref I2C: Mutex<Option<I2cDriver<'static>>> = Mutex::new(None);
+    static ref I2C: Mutex<Option<Arc<Mutex<I2cDriver<'static>>>>> = Mutex::new(None);
+}
+
+#[derive(Clone)]
+struct SharedI2c(Arc<Mutex<I2cDriver<'static>>>);
+impl SharedI2c {
+    pub fn new(i2c: Arc<Mutex<I2cDriver<'static>>>) -> Self {
+        SharedI2c(i2c)
+    }
+}
+impl ErrorType for SharedI2c {
+    type Error = I2cError; // Replace with the actual error type from `I2cDriver`
+}
+impl I2c for SharedI2c {
+    fn read(&mut self, addr: u8, buffer: &mut [u8]) -> Result<(), Self::Error> {
+        let mut guard = self.0.lock().unwrap();
+        Ok(guard.read(addr, buffer, 1000)?) // Add timeout (adjust value as needed)
+    }
+
+    fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+        let mut guard = self.0.lock().unwrap();
+        Ok(guard.write(addr, bytes, 1000)?) // Directly return I2cDriver's error
+    }
+
+    fn write_read(
+        &mut self,
+        address: u8,
+        write: &[u8],
+        read: &mut [u8],
+    ) -> std::result::Result<(), Self::Error> {
+        self.transaction(
+            address,
+            &mut [
+                esp_idf_hal::i2c::Operation::Write(write),
+                esp_idf_hal::i2c::Operation::Read(read),
+            ],
+        )
+    }
+
+    fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [esp_idf_hal::i2c::Operation<'_>],
+    ) -> std::result::Result<(), Self::Error> {
+        let mut guard = self.0.lock().unwrap();
+        Ok(guard.transaction(address, operations, 1000)?) // Timeout in milliseconds
+    }
+}
 
 enum SsnSensorPeriod {
     Fast,
@@ -72,7 +134,25 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
         pressure_last_sent_value: i32,
         altitude: f32,
         period: SsnSensorPeriod,
-        sensor: BMP180Sensor<esp_idf_hal::i2c::I2cDriver<'static>, esp_idf_hal::delay::FreeRtos>,
+        // sensor: BMP180Sensor<esp_idf_hal::i2c::I2cDriver<'static>, esp_idf_hal::delay::FreeRtos>,
+        sensor: BMP180Sensor<SharedI2c, esp_idf_hal::delay::FreeRtos>,
+    },
+    Ens160 {
+        co2eq_ppm: i16,
+        co2eq_delta: f32,
+        co2eq_last_update: Instant,
+        co2eq_last_sent_value: i16,
+        tvoc_ppb: i16,
+        tvoc_delta: f32,
+        tvoc_last_update: Instant,
+        tvoc_last_sent_value: i16,
+        aqi: i8,
+        aqi_delta: f32,
+        aqi_last_update: Instant,
+        aqi_last_sent_value: i8,
+        period: SsnSensorPeriod,
+        // sensor: ENS160Sensor<esp_idf_hal::i2c::I2cDriver<'static>>,
+        sensor: ENS160Sensor<SharedI2c>,
     },
     Adc {
         raw_value: u16,
@@ -210,16 +290,58 @@ fn main_logic() -> Result<()> {
     // let sda = peripherals.pins.gpio13;
     // let scl = peripherals.pins.gpio14;
     let i2c = peripherals.i2c0;
-    let config = I2cConfig::new().baudrate(100.kHz().into());
-    let i2c = I2cDriver::new(
-        i2c,
-        sda,
-        scl,
-        &esp_idf_svc::hal::i2c::config::Config::default(),
-    )?;
+    let config = I2cConfig::new().baudrate(400.kHz().into());
+    let i2c_driver = I2cDriver::new(i2c, sda, scl, &config)?;
+    // let hal_i2c = i2c_driver.reverse();
 
-    // let sensor = bmp180::init(i2c);
-    // let mut sensor = bmp180::BMP180Sensor::new(i2c, FreeRtos)?; //.context("Failed to initialize BMP180 sensor")?;
+    fn init_i2c(i2c: I2cDriver<'static>) {
+        // *I2C.lock().unwrap() = Some(i2c);
+        *I2C.lock().unwrap() = Some(Arc::new(Mutex::new(i2c)));
+        log::info!("I2C initialized");
+    }
+
+    // let i2c_lock = I2C.lock().unwrap().as_mut().unwrap();
+    // let mut i2c = i2c_handle.lock().unwrap();
+
+    let i2c_lock = Arc::new(Mutex::new(i2c_driver));
+
+    // let shared_i2c = SharedI2c::new(i2c_lock); // Your wrapper implementing `I2c`
+    let shared_i2c = SharedI2c::new(i2c_lock.clone()); // Your wrapper implementing `I2c`
+    let mut ens160 = ens160::ENS160Sensor::new(shared_i2c.clone()).unwrap();
+    FreeRtos::delay_ms(1500);
+    let (co2eq_ppm, tvoc_ppb, aqi) = ens160.get_data().unwrap();
+    log::info!(
+        "ens160 results: co2eq_ppm={}, tvoc_ppb={}, aqi={}",
+        co2eq_ppm,
+        tvoc_ppb,
+        aqi
+    );
+
+    ssn_devices.push(SsnDevice {
+        dev_id: "ens160-test".to_string(),
+        is_active: true,
+        is_paused: false,
+        device: SsnDevices::Ens160 {
+            co2eq_ppm: (-1),
+            co2eq_delta: (5.0),
+            co2eq_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+            co2eq_last_sent_value: (-1),
+            tvoc_ppb: (-1),
+            tvoc_delta: (2.0),
+            tvoc_last_update: (Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30)),
+            tvoc_last_sent_value: (-1),
+            aqi: (-1),
+            aqi_delta: (1.0),
+            aqi_last_update: (Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30)),
+            aqi_last_sent_value: (-1),
+            period: SsnSensorPeriod::Slow,
+            sensor: ens160::ENS160Sensor::new(shared_i2c).unwrap(),
+        },
+    });
+
+    // let i2c_handle = I2C.lock().unwrap().as_mut().unwrap();
+    // let mut i2c = i2c_handle.lock().unwrap();
+
     ssn_devices.push(SsnDevice {
         dev_id: "bmp180-test".to_string(),
         is_active: true,
@@ -235,7 +357,7 @@ fn main_logic() -> Result<()> {
             pressure_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
             altitude: (0.0),
             period: SsnSensorPeriod::Slow,
-            sensor: (bmp180::BMP180Sensor::new(i2c, FreeRtos)?),
+            sensor: (bmp180::BMP180Sensor::new(SharedI2c::new(i2c_lock.clone()), FreeRtos)?),
         },
     });
 
@@ -319,12 +441,16 @@ fn main_logic() -> Result<()> {
         let pixel: [u8; 3] = red.as_ref().try_into().unwrap();
         ws2812.write_blocking(pixel.clone().into_iter()).unwrap();
 
-        FreeRtos::delay_ms(1500); // Wait 500ms
+        FreeRtos::delay_ms(2000); // Wait 500ms
 
-        // let (temperature, pressure, altitude) = sensor.read_all(Resolution::UltraHighResolution)?;
-        // let (temperature, pressure, altitude) = sensor.get_data().unwrap();
-
-        // let mut values_array: Vec<ValuesDev> = vec![];
+        // let (co2eq_ppm, tvoc_ppb, aqi) = ens160.get_data().unwrap_or_default();
+        // log::info!(
+        //     "ens160 results: co2eq_ppm={}, tvoc_ppb={}, aqi={}",
+        //     co2eq_ppm,
+        //     tvoc_ppb,
+        //     aqi
+        // );
+        // FreeRtos::delay_ms(1000); // Wait 500ms
 
         // iterate through all devices, refresh their data and publish it:
         for cur_device in &mut ssn_devices {
@@ -492,6 +618,107 @@ fn main_logic() -> Result<()> {
                         )?;
                         *last_update = now;
                         *last_sent_value = *data;
+                    }
+                }
+                SsnDevices::Ens160 {
+                    sensor,
+                    co2eq_ppm,
+                    tvoc_ppb,
+                    aqi,
+                    co2eq_delta,
+                    tvoc_delta,
+                    aqi_delta,
+                    co2eq_last_update,
+                    tvoc_last_update,
+                    aqi_last_update,
+                    co2eq_last_sent_value,
+                    tvoc_last_sent_value,
+                    aqi_last_sent_value,
+                    ..
+                } => {
+                    let (new_co2eq, new_tvoc, new_aqi) = sensor.get_data().unwrap_or((-1, -1, -1));
+
+                    // Calculate percentage changes
+                    let co2eq_change_pct = if *co2eq_last_sent_value != 0 {
+                        ((new_co2eq as f32 - *co2eq_last_sent_value as f32).abs()
+                            / *co2eq_last_sent_value as f32)
+                            * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    let tvoc_change_pct = if *tvoc_last_sent_value != 0 {
+                        ((new_tvoc as f32 - *tvoc_last_sent_value as f32).abs()
+                            / *tvoc_last_sent_value as f32)
+                            * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    let aqi_change_pct = if *aqi_last_sent_value != 0 {
+                        ((new_aqi as f32 - *aqi_last_sent_value as f32).abs()
+                            / *aqi_last_sent_value as f32)
+                            * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    log::info!(
+                        "ENS160 - CO₂eq: {} ppm (Δ {:.2}%), TVOC: {} ppb (Δ {:.2}%), AQI: {} (Δ {:.2}%)",
+                        new_co2eq,
+                        co2eq_change_pct,
+                        new_tvoc,
+                        tvoc_change_pct,
+                        new_aqi,
+                        aqi_change_pct
+                    );
+
+                    // Update values
+                    *co2eq_ppm = new_co2eq;
+                    *tvoc_ppb = new_tvoc;
+                    *aqi = new_aqi;
+
+                    // Check and send CO2eq if needed
+                    if co2eq_change_pct >= *co2eq_delta
+                        || co2eq_last_update.elapsed()
+                            > Duration::from_secs(MAX_PERIOD_REFRESH_MQTT)
+                    {
+                        client.enqueue(
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            QoS::AtLeastOnce,
+                            false,
+                            co2eq_ppm.to_string().as_bytes(),
+                        )?;
+                        *co2eq_last_update = now;
+                        *co2eq_last_sent_value = *co2eq_ppm;
+                    }
+
+                    // Check and send TVOC if needed
+                    if tvoc_change_pct >= *tvoc_delta
+                        || tvoc_last_update.elapsed() > Duration::from_secs(MAX_PERIOD_REFRESH_MQTT)
+                    {
+                        client.enqueue(
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
+                            QoS::AtLeastOnce,
+                            false,
+                            tvoc_ppb.to_string().as_bytes(),
+                        )?;
+                        *tvoc_last_update = now;
+                        *tvoc_last_sent_value = *tvoc_ppb;
+                    }
+
+                    // Check and send AQI if needed
+                    if aqi_change_pct >= *aqi_delta
+                        || aqi_last_update.elapsed() > Duration::from_secs(MAX_PERIOD_REFRESH_MQTT)
+                    {
+                        client.enqueue(
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "2"),
+                            QoS::AtLeastOnce,
+                            false,
+                            aqi.to_string().as_bytes(),
+                        )?;
+                        *aqi_last_update = now;
+                        *aqi_last_sent_value = *aqi;
                     }
                 }
             }
