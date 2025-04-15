@@ -23,8 +23,8 @@ default = []
 experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
-log = "0.4"
-anyhow      = "=1.0.97"
+log = "0.4.27"
+anyhow      = "1.0.98"
 embedded-svc = "=0.28.1"
 esp-idf-svc = { version = "=0.51.0" }
 esp-idf-sys = { version = "0.36.1", features = ["binstart"] }
@@ -44,6 +44,7 @@ regex = "1.5"
 lazy_static = "1.4" 
 ens160 = "0.6.1"
 embedded-hal-compat = "0.13.0"
+ahtx0 = "0.1.4"
 
 # [dependencies.smart-leds-trait]
 # optional = true

@@ -41,7 +41,8 @@ mod commons;
 use commons::ValuesDev;
 
 mod mqtt_messages;
-mod wifi;
+mod ssn_wifi;
+
 use bincode::{config, Decode, Encode};
 // use esp_idf_hal::i2c::I2cError;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,9 @@ use esp_idf_hal::gpio::AnyIOPin;
 
 mod ens160;
 use ens160::ENS160Sensor;
+
+mod aht21;
+use aht21::AHT21Sensor;
 
 // if sensor value is not changed in this period mqtt message will by sended anyway
 const MAX_PERIOD_REFRESH_MQTT: u64 = 20;
@@ -163,6 +167,18 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
         period: SsnSensorPeriod,
         sensor: AdcReader<P>,
     },
+    Aht21 {
+        temperature: f32,
+        temperature_delta: f32, // delta between previous and new measurments for trigger sending mqtt message%
+        temperature_last_update: Instant,
+        temperature_last_sent_value: f32,
+        humidity: f32,
+        humidity_delta: f32,
+        humidity_last_update: Instant,
+        humidity_last_sent_value: f32,
+        sensor: AHT21Sensor<SharedI2c>,
+        period: SsnSensorPeriod,
+    },
     StoreInt {
         period: SsnSensorPeriod,
         data: i32,
@@ -180,18 +196,6 @@ struct SsnDevice<P: ADCPin<Adc = ADC1>> {
     device: SsnDevices<P>,
 }
 
-// impl <P: ADCPin<Adc = ADC1>> Default for SsnDevice <P> {
-//     fn default() -> Self {
-//         Self {
-//             dev_id: "0".to_string(),
-//             is_active: false,
-//             is_paused: false,
-//             device: SsnDevices::StoreInt { data: 0 }
-//         }
-//     }
-// }
-
-// fn main() -> Result<()> {
 // Main logic that might return an error
 fn main_logic() -> Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -274,15 +278,20 @@ fn main_logic() -> Result<()> {
     let blue = LedPixelColorGrb24::new_with_rgb(0, 0, 30);
 
     // // Initialize Wi-Fi
-    let sys_loop = EspSystemEventLoop::take()?;
-
-    // Connect to the Wi-Fi network
-    let _wifi = wifi::wifi(
+    let sysloop = EspSystemEventLoop::take()?;
+    let mut my_wifi = ssn_wifi::wifi(
         app_config.wifi_ssid.as_str(),
         app_config.wifi_psk.as_str(),
         peripherals.modem,
-        sys_loop,
-    )?;
+        sysloop.clone(),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "WiFi init failed for SSID {}: {:?}",
+            app_config.wifi_ssid,
+            e
+        )
+    })?;
 
     log::info!("Our SSID is:");
     log::info!("{}", app_config.wifi_ssid);
@@ -307,15 +316,32 @@ fn main_logic() -> Result<()> {
 
     // let shared_i2c = SharedI2c::new(i2c_lock); // Your wrapper implementing `I2c`
     let shared_i2c = SharedI2c::new(i2c_lock.clone()); // Your wrapper implementing `I2c`
-    let mut ens160 = ens160::ENS160Sensor::new(shared_i2c.clone()).unwrap();
-    FreeRtos::delay_ms(1500);
-    let (co2eq_ppm, tvoc_ppb, aqi) = ens160.get_data().unwrap();
-    log::info!(
-        "ens160 results: co2eq_ppm={}, tvoc_ppb={}, aqi={}",
-        co2eq_ppm,
-        tvoc_ppb,
-        aqi
-    );
+
+    // Initialize AHT21 sensor
+    let mut aht21 = AHT21Sensor::new(shared_i2c.clone()).unwrap();
+
+    // Read sensor data
+    let (temperature, humidity) = aht21.get_data().unwrap();
+    log::info!("temperature (aht21): {:.2}C", temperature);
+    log::info!("humidity (aht21): {:.2}%", humidity);
+
+    ssn_devices.push(SsnDevice {
+        dev_id: "aht21-test".to_string(),
+        is_active: true,
+        is_paused: false,
+        device: SsnDevices::Aht21 {
+            temperature: 0.0,
+            temperature_delta: 0.5, // 0.5%
+            temperature_last_sent_value: 0.0,
+            temperature_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+            humidity: 0.0,
+            humidity_delta: 0.5, // 0.5%
+            humidity_last_sent_value: 0.0,
+            humidity_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+            period: SsnSensorPeriod::Slow,
+            sensor: AHT21Sensor::new(SharedI2c::new(i2c_lock.clone())).unwrap(),
+        },
+    });
 
     ssn_devices.push(SsnDevice {
         dev_id: "ens160-test".to_string(),
@@ -435,13 +461,28 @@ fn main_logic() -> Result<()> {
     // ********************* main loop
 
     loop {
+        // Check WiFi connection status
+        if !ssn_wifi::check_wifi_connection(my_wifi.wifi()) {
+            log::warn!("WiFi connection lost. Attempting to reconnect...");
+
+            my_wifi.stop()?;
+            my_wifi.start()?;
+
+            if let Err(e) = ssn_wifi::connect_wifi(&mut my_wifi, &sysloop.clone()) {
+                log::error!("Failed to reconnect WiFi: {:?}", e);
+                // You might want to add a delay here before retrying
+                std::thread::sleep(Duration::from_secs(10));
+                continue;
+            }
+        }
+
         led.set_high().unwrap(); // Turn the LED on
         println!("LED ON");
         // Set all LEDs to red
         let pixel: [u8; 3] = red.as_ref().try_into().unwrap();
         ws2812.write_blocking(pixel.clone().into_iter()).unwrap();
 
-        FreeRtos::delay_ms(2000); // Wait 500ms
+        FreeRtos::delay_ms(2000);
 
         // let (co2eq_ppm, tvoc_ppb, aqi) = ens160.get_data().unwrap_or_default();
         // log::info!(
@@ -547,12 +588,12 @@ fn main_logic() -> Result<()> {
                         0.0
                     };
                     log::info!(
-                        "New: temperature={:.2}, pressure={}, altitude={}, delta_temperature(%)={:.4}, delta_pressure(%)={:.5}",
-                        new_temp,
-                        new_pressure,
-                        new_alt,
-                        temp_change_pct, pressure_change_pct
-                    );
+                                    "New: temperature={:.2}, pressure={}, altitude={}, delta_temperature(%)={:.4}, delta_pressure(%)={:.5}",
+                                    new_temp,
+                                    new_pressure,
+                                    new_alt,
+                                    temp_change_pct, pressure_change_pct
+                                );
 
                     *temperature = new_temp;
                     *pressure = new_pressure;
@@ -590,7 +631,6 @@ fn main_logic() -> Result<()> {
                         log::info!("Bmp180 - skip sending pressure to mqtt");
                     }
                 }
-
                 SsnDevices::StoreInt {
                     period,
                     data,
@@ -664,14 +704,14 @@ fn main_logic() -> Result<()> {
                     };
 
                     log::info!(
-                        "ENS160 - CO₂eq: {} ppm (Δ {:.2}%), TVOC: {} ppb (Δ {:.2}%), AQI: {} (Δ {:.2}%)",
-                        new_co2eq,
-                        co2eq_change_pct,
-                        new_tvoc,
-                        tvoc_change_pct,
-                        new_aqi,
-                        aqi_change_pct
-                    );
+                                    "ENS160 - CO₂eq: {} ppm (Δ {:.2}%), TVOC: {} ppb (Δ {:.2}%), AQI: {} (Δ {:.2}%)",
+                                    new_co2eq,
+                                    co2eq_change_pct,
+                                    new_tvoc,
+                                    tvoc_change_pct,
+                                    new_aqi,
+                                    aqi_change_pct
+                                );
 
                     // Update values
                     *co2eq_ppm = new_co2eq;
@@ -721,9 +761,94 @@ fn main_logic() -> Result<()> {
                         *aqi_last_sent_value = *aqi;
                     }
                 }
+                SsnDevices::Aht21 {
+                    temperature,
+                    temperature_delta,
+                    temperature_last_update,
+                    temperature_last_sent_value,
+                    humidity,
+                    humidity_delta,
+                    humidity_last_update,
+                    humidity_last_sent_value,
+                    sensor,
+                    period,
+                } => {
+                    log::info!(
+                        "Old: temperature={:.2}°C, humidity={:.2}%",
+                        temperature,
+                        humidity
+                    );
+
+                    // Read sensor data with error handling
+                    let (new_temp, new_humidity) = match sensor.get_data() {
+                        Ok(data) => data,
+                        Err(e) => {
+                            log::error!("AHT21 read failed: {:?}", e);
+                            continue; // Skip this iteration if reading fails
+                        }
+                    };
+
+                    // Calculate percentage changes
+                    let temp_change_pct = if *temperature != 0.0 {
+                        ((new_temp - *temperature).abs() / *temperature) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let humidity_change_pct = if *humidity != 0.0 {
+                        ((new_humidity - *humidity).abs() / *humidity) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    log::info!(
+                        "New: temperature={:.2}°C (Δ {:.2}%), humidity={:.2}% (Δ {:.2}%)",
+                        new_temp,
+                        temp_change_pct,
+                        new_humidity,
+                        humidity_change_pct
+                    );
+
+                    // Update values
+                    *temperature = new_temp;
+                    *humidity = new_humidity;
+
+                    // Send temperature if delta threshold or max period is exceeded
+                    if temp_change_pct >= *temperature_delta
+                        || temperature_last_update.elapsed()
+                            > Duration::from_secs(MAX_PERIOD_REFRESH_MQTT)
+                    {
+                        client.enqueue(
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            QoS::AtLeastOnce,
+                            false,
+                            temperature.to_string().as_bytes(),
+                        )?;
+                        *temperature_last_update = now;
+                        *temperature_last_sent_value = *temperature;
+                    } else {
+                        log::info!("AHT21 - skip sending temperature to MQTT");
+                    }
+
+                    // Send humidity if delta threshold or max period is exceeded
+                    if humidity_change_pct >= *humidity_delta
+                        || humidity_last_update.elapsed()
+                            > Duration::from_secs(MAX_PERIOD_REFRESH_MQTT)
+                    {
+                        client.enqueue(
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
+                            QoS::AtLeastOnce,
+                            false,
+                            humidity.to_string().as_bytes(),
+                        )?;
+                        *humidity_last_update = now;
+                        *humidity_last_sent_value = *humidity;
+                    } else {
+                        log::info!("AHT21 - skip sending humidity to MQTT");
+                    }
+                }
             }
             // little pause between measurments
-            FreeRtos::delay_ms(100); // Wait 100ms
+            FreeRtos::delay_ms(500); // Wait 500ms
         }
 
         led.set_low().unwrap(); // Turn the LED off
