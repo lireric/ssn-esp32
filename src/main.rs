@@ -3,6 +3,9 @@ use anyhow::{Context, Result};
 use core::str;
 use embedded_hal::i2c::ErrorType;
 use embedded_hal::i2c::I2c;
+use esp_idf_svc::mqtt::client::EspMqttEvent;
+use esp_idf_svc::mqtt::client::EventPayload;
+use log::error;
 use utils::calculate_percentage_change;
 use utils::handle_sensor_value_update;
 
@@ -24,7 +27,7 @@ use esp_idf_svc::{
         prelude::*,
     },
     http::server::{Configuration, EspHttpServer},
-    mqtt::client::{Details, EspMqttClient, MqttClientConfiguration},
+    mqtt::client::{Details, EspMqttClient, Event, MqttClientConfiguration},
     nvs::{EspDefaultNvsPartition, EspNvs, EspNvsPartition, NvsDefault},
 };
 use esp_idf_sys::{self as _}; // Import the ESP-IDF bindings
@@ -69,6 +72,8 @@ mod utils;
 
 // if sensor value is not changed in this period mqtt message will by sended anyway
 const MAX_PERIOD_REFRESH_MQTT: u64 = 20;
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+const RECONNECT_DELAY_MS: u64 = 5000;
 
 lazy_static! {
     // static ref I2C: Mutex<Option<I2cDriver<'static>>> = Mutex::new(None);
@@ -408,8 +413,19 @@ fn main_logic() -> Result<()> {
         },
     });
 
-    // MQTT Client configuration:
+    // MQTT Client configuration *******************************************************
+
     log::info!("MQTT Client configuration");
+    let mut reconnect_attempts = 0;
+
+    let topics_to_subscribe = vec![
+        format!("/ssn/acc/{}/raw_data", &account),
+        format!("/ssn/acc/{}/obj/+/commands", &account),
+        format!("/ssn/acc/{}/obj/+/commands/ini", &account),
+        format!("/ssn/acc/{}/obj/+/commands/json", &account),
+        format!("/ssn/acc/{}/obj/+/commands/device/+/+/in", &account),
+    ];
+
     let broker_url = if !app_config.mqtt_user.is_empty() {
         format!(
             "mqtt://{}:{}@{}",
@@ -419,12 +435,68 @@ fn main_logic() -> Result<()> {
         format!("mqtt://{}", app_config.mqtt_host)
     };
 
-    let mqtt_config = MqttClientConfiguration::default();
+    let mqtt_client_id = app_config.mqtt_client_id.clone();
+    // let mut mqtt_config = MqttClientConfiguration::default();
+    let mqtt_config = MqttClientConfiguration {
+        client_id: Some(mqtt_client_id.as_str()),
+        ..Default::default()
+    };
 
     log::info!("Hello, world!");
-    let mqtt_client_id = app_config.mqtt_client_id.clone();
 
-    // Set the HTTP server
+    // let mut client = EspMqttClient::new_cb(&broker_url, &mqtt_config, move |_message_event| {})?;
+    // let (mut client, mut connection) = EspMqttClient::new(&broker_url, &mqtt_config)?;
+    let mut client = EspMqttClient::new_cb(&broker_url, &mqtt_config, move |message_event| {
+        match message_event.payload() {
+            EventPayload::Received { data, topic, .. } => {
+                log::info!("Received message on {:?}: {:?}", topic, data);
+                mqtt_messages::process_message(topic, data);
+            }
+            EventPayload::Subscribed(id) => info!("Subscribed to id: {}", id),
+            EventPayload::Disconnected => {
+                warn!("MQTT disconnected, attempting to reconnect...");
+                if reconnect_attempts < MAX_RECONNECT_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(RECONNECT_DELAY_MS));
+                    reconnect_attempts += 1;
+                    // You'll need to recreate the client here
+                    // This might require restructuring to store broker_url and config
+                } else {
+                    error!("Max reconnection attempts reached");
+                }
+            }
+            EventPayload::BeforeConnect => {
+                info!("MQTT BeforeConnect");
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+            EventPayload::Connected(_) => {
+                info!("MQTT reconnected successfully");
+                reconnect_attempts = 0;
+            }
+            EventPayload::Error(e) => {
+                warn!("MQTT error: {:?}", e);
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+            _ => info!("Received from MQTT: {:?}", message_event.payload()),
+        }
+    })?;
+
+    std::thread::sleep(Duration::from_millis(3000));
+    // Subscribe to topics
+    for topic in topics_to_subscribe {
+        info!("MQTT subscribe to {}", &topic);
+        client.subscribe(&topic, QoS::AtLeastOnce)?;
+    }
+
+    // publish start message
+    // let payload: &[u8] = &[];
+    client.enqueue(
+        &mqtt_messages::status_topic(&account, &object, "start"),
+        QoS::AtLeastOnce,
+        true,
+        mqtt_client_id.as_bytes(),
+    )?;
+
+    // Set the HTTP server **************************************************************
     let mut server = EspHttpServer::new(&Configuration::default())?;
     // http://<sta ip>/ handler
     server.fn_handler(
@@ -450,17 +522,6 @@ fn main_logic() -> Result<()> {
     )?;
 
     log::info!("Http server awaiting connection");
-
-    let mut client = EspMqttClient::new_cb(&broker_url, &mqtt_config, move |_message_event| {})?;
-
-    // 2. publish an empty hello message
-    let payload: &[u8] = &[];
-    client.enqueue(
-        &mqtt_messages::hello_topic(mqtt_client_id.as_str()),
-        QoS::AtLeastOnce,
-        true,
-        payload,
-    )?;
 
     // ********************* main loop
 

@@ -9,16 +9,8 @@ use std::{
 // mod commons;
 use crate::commons::ValuesDev;
 
-pub fn temperature_data_topic(uuid: &str) -> String {
-    format!("{}/sensor_data/temperature", uuid)
-}
-
-pub fn pressure_data_topic(uuid: &str) -> String {
-    format!("{}/sensor_data/pressure", uuid)
-}
-
-pub fn hello_topic(uuid: &str) -> String {
-    format!("{}/hello", uuid)
+pub fn status_topic(acc: &str, obj: &str, event: &str) -> String {
+    format!("/ssn/acc/{}/obj/{}/{}", acc, obj, event)
 }
 
 pub fn publish_sensor_topic(acc: &str, obj: &str, dev: &str, channel: &str) -> String {
@@ -206,3 +198,5 @@ pub fn fill_device_types_map(
     log::info!("DeviceTypesMap filled, size: {}", device_map.len());
     device_map
 }
+
+pub fn process_message(topic: Option<&str>, data: &[u8]) {}
