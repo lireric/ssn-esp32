@@ -5,6 +5,8 @@ use embedded_svc::mqtt::client::{
 use std::fmt::{Debug, Display};
 use std::time::{Duration, Instant};
 
+use crate::{update_sensor_data, SharedSensorData};
+
 // use crate::mqtt_messages;
 
 // Helper function to calculate percentage change
@@ -49,6 +51,7 @@ where
                     current_value,
                     threshold
                 );
+                *last_sent_value = Some(current_value); // if such values is a new reality we'll send it for next iteration
                 return Ok(());
             }
         }

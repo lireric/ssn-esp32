@@ -3,9 +3,15 @@ use anyhow::{Context, Result};
 use core::str;
 use embedded_hal::i2c::ErrorType;
 use embedded_hal::i2c::I2c;
+use esp_idf_hal::peripherals;
+
 use esp_idf_svc::mqtt::client::EspMqttEvent;
 use esp_idf_svc::mqtt::client::EventPayload;
 use log::error;
+use std::borrow::Borrow;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use utils::calculate_percentage_change;
 use utils::handle_sensor_value_update;
 
@@ -40,6 +46,7 @@ use std::{
 
 // my modules:
 mod commons;
+use commons::Colors;
 use commons::ValuesDev;
 
 mod mqtt_messages;
@@ -71,9 +78,12 @@ use aht21::AHT21Sensor;
 mod utils;
 
 // if sensor value is not changed in this period mqtt message will by sended anyway
-const MAX_PERIOD_REFRESH_MQTT: u64 = 20;
+const MAX_PERIOD_REFRESH_MQTT: u64 = 60; // sec.
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const RECONNECT_DELAY_MS: u64 = 5000;
+const MAIN_LOOP_DELAY_MS: u64 = 100;
+const MIDDLE_LOOP_PERIOD_MS: u64 = 10000;
+const SLOW_LOOP_PERIOD_MS: u64 = 60000;
 
 lazy_static! {
     // static ref I2C: Mutex<Option<I2cDriver<'static>>> = Mutex::new(None);
@@ -128,6 +138,7 @@ impl I2c for SharedI2c {
 
 enum SsnSensorPeriod {
     Fast,
+    Middle,
     Slow,
 }
 
@@ -144,7 +155,6 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
         pressure_last_update: Instant,
         pressure_last_sent_value: Option<i32>,
         altitude: f32,
-        period: SsnSensorPeriod,
         // sensor: BMP180Sensor<esp_idf_hal::i2c::I2cDriver<'static>, esp_idf_hal::delay::FreeRtos>,
         sensor: BMP180Sensor<SharedI2c, esp_idf_hal::delay::FreeRtos>,
     },
@@ -164,7 +174,6 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
         aqi_delta_over: Option<f32>, // Skip if AQI exceeds this threshold
         aqi_last_update: Instant,
         aqi_last_sent_value: Option<i8>,
-        period: SsnSensorPeriod,
         // sensor: ENS160Sensor<esp_idf_hal::i2c::I2cDriver<'static>>,
         sensor: ENS160Sensor<SharedI2c>,
     },
@@ -176,7 +185,6 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
         raw_value_last_sent_value: Option<u16>,
         voltage_value_last_sent_value: Option<f32>,
         voltage_mv: f32,
-        period: SsnSensorPeriod,
         sensor: AdcReader<P>,
     },
     Aht21 {
@@ -191,10 +199,8 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
         humidity_last_update: Instant,
         humidity_last_sent_value: Option<f32>,
         sensor: AHT21Sensor<SharedI2c>,
-        period: SsnSensorPeriod,
     },
     StoreInt {
-        period: SsnSensorPeriod,
         data: i32,
         delta: f32,
         delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
@@ -203,14 +209,251 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
     },
 }
 
+#[derive(Debug)]
+pub struct SsnChannelInfo {
+    pub index: usize,
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+impl<P: ADCPin<Adc = ADC1>> SsnDevice<P> {
+    pub fn get_channels(&self) -> Vec<SsnChannelInfo> {
+        match &self.device {
+            SsnDevices::Bmp180 { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "temperature",
+                    description: "Temperature in °C",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "pressure",
+                    description: "Pressure in hPa",
+                },
+                SsnChannelInfo {
+                    index: 2,
+                    name: "altitude",
+                    description: "Altitude in meters",
+                },
+            ],
+            SsnDevices::Ens160 { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "co2",
+                    description: "CO2 equivalent in ppm",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "tvoc",
+                    description: "TVOC in ppb",
+                },
+                SsnChannelInfo {
+                    index: 2,
+                    name: "aqi",
+                    description: "Air Quality Index",
+                },
+            ],
+            SsnDevices::Adc { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "voltage",
+                    description: "Voltage in mV",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "raw",
+                    description: "Raw ADC value",
+                },
+            ],
+            SsnDevices::Aht21 { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "temperature",
+                    description: "Temperature in °C",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "humidity",
+                    description: "Humidity in %",
+                },
+            ],
+            SsnDevices::StoreInt { .. } => vec![SsnChannelInfo {
+                index: 0,
+                name: "value",
+                description: "Stored integer value",
+            }],
+        }
+    }
+    // Return real channel by it name or 0
+    pub fn get_channel_by_name(&self, name: &str) -> usize {
+        self.get_channels()
+            .into_iter()
+            .find(|c| c.name == name)
+            .map(|c| c.index)
+            .unwrap_or(0)
+    }
+
+    pub fn get_value_by_channel(&self, channel: usize) -> Option<f32> {
+        let channel = self
+            .get_channels()
+            .into_iter()
+            .find(|c| c.index == channel)?
+            .name;
+
+        match &self.device {
+            SsnDevices::Bmp180 {
+                temperature,
+                pressure,
+                altitude,
+                ..
+            } => match channel {
+                "temperature" => Some(*temperature),
+                "pressure" => Some(*pressure as f32),
+                "altitude" => Some(*altitude),
+                _ => None,
+            },
+            SsnDevices::Ens160 {
+                co2eq_ppm,
+                tvoc_ppb,
+                aqi,
+                ..
+            } => match channel {
+                "co2" => Some(*co2eq_ppm as f32),
+                "tvoc" => Some(*tvoc_ppb as f32),
+                "aqi" => Some(*aqi as f32),
+                _ => None,
+            },
+            SsnDevices::Adc {
+                voltage_mv,
+                raw_value,
+                ..
+            } => match channel {
+                "voltage" => Some(*voltage_mv),
+                "raw" => Some(*raw_value as f32),
+                _ => None,
+            },
+            SsnDevices::Aht21 {
+                temperature,
+                humidity,
+                ..
+            } => match channel {
+                "temperature" => Some(*temperature),
+                "humidity" => Some(*humidity),
+                _ => None,
+            },
+            SsnDevices::StoreInt { data, .. } => match channel {
+                "value" => Some(*data as f32),
+                _ => None,
+            },
+        }
+    }
+}
+
+impl<P: ADCPin<Adc = ADC1>> SsnDevices<P> {
+    pub fn get_value_by_channel(
+        devices: &[SsnDevice<P>],
+        dev_id: &str,
+        channel_index: usize,
+    ) -> Option<f32> {
+        devices
+            .iter()
+            .find(|d| d.dev_id == dev_id)
+            .and_then(|device| device.get_value_by_channel(channel_index))
+    }
+}
+impl<P: ADCPin<Adc = ADC1>> SsnDevice<P> {
+    pub fn get_device_by_id(
+        devices: &[SharedSsnDevice<P>],
+        dev_id: &str,
+    ) -> Option<SharedSsnDevice<P>> {
+        devices
+            .iter()
+            .find(|d| d.lock().unwrap().dev_id == dev_id)
+            .map(Arc::clone)
+    }
+}
+
 // #[derive(Default)]
 struct SsnDevice<P: ADCPin<Adc = ADC1>> {
     dev_id: String,
+    period: SsnSensorPeriod,
     is_active: bool,
     is_paused: bool,
     device: SsnDevices<P>,
 }
+type SharedSsnDevice<P> = Arc<Mutex<SsnDevice<P>>>;
 
+fn create_shared_devices<P: ADCPin<Adc = ADC1>>(
+    devices: Vec<SsnDevice<P>>,
+) -> Vec<SharedSsnDevice<P>> {
+    devices
+        .into_iter()
+        .map(|d| Arc::new(Mutex::new(d)))
+        .collect()
+}
+
+impl<P: ADCPin<Adc = ADC1>> SsnDevice<P> {
+    pub fn add_shared_device(devices: &mut Vec<SharedSsnDevice<P>>, new_device: SsnDevice<P>) {
+        devices.push(Arc::new(Mutex::new(new_device)));
+    }
+}
+
+fn read_device_value<P: ADCPin<Adc = ADC1>>(
+    device: &SharedSsnDevice<P>,
+    channel: usize,
+) -> Option<f32> {
+    let guard = device.lock().unwrap(); // Blocks until lock acquired
+    guard.get_value_by_channel(channel)
+}
+
+type SharedSensorData = Arc<Mutex<HashMap<String, Vec<f32>>>>;
+
+fn create_shared_data() -> SharedSensorData {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+// update function
+fn update_sensor_data(data: &SharedSensorData, dev_id: String, values: Vec<f32>) -> Result<()> {
+    let mut guard = data.lock().unwrap();
+    guard.insert(dev_id, values);
+    Ok(())
+}
+
+// read function
+fn get_sensor_values(data: &SharedSensorData, dev_id: &str) -> Option<Vec<f32>> {
+    let guard = data.lock().unwrap();
+    guard.get(dev_id).cloned()
+}
+
+struct SsnDeviceCommand {
+    dev_id: String,
+    channel: u8,
+    value: f32,
+}
+
+type SharedSsnDeviceCommand = Arc<Mutex<Vec<SsnDeviceCommand>>>;
+fn create_commands_array() -> SharedSsnDeviceCommand {
+    Arc::new(Mutex::new(Vec::new()))
+}
+// push command
+fn push_command(data: &SharedSsnDeviceCommand, command: SsnDeviceCommand) -> Result<()> {
+    let mut guard = data.lock().unwrap();
+    log::info!(
+        "push_command: dev={}, channel={}, val={}",
+        command.dev_id,
+        command.channel,
+        command.value
+    );
+    guard.push(command);
+    Ok(())
+}
+// push command
+fn pop_command(data: &SharedSsnDeviceCommand) -> Option<SsnDeviceCommand> {
+    let mut guard = data.lock().unwrap();
+    guard.pop()
+}
+
+// =====================================================================================
 // Main logic that might return an error
 fn main_logic() -> Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -221,6 +464,12 @@ fn main_logic() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let mut ssn_devices = vec![];
+    let mut shared_devices = create_shared_devices(ssn_devices);
+    let shared_data = create_shared_data();
+    let shared_data_ref = shared_data.clone();
+
+    let commands_array = create_commands_array();
+    let commands_array_ref = commands_array.clone();
 
     // Initialize NVS
     let nvs_default_partition: EspNvsPartition<NvsDefault> =
@@ -248,45 +497,55 @@ fn main_logic() -> Result<()> {
 
     let peripherals = esp_idf_hal::peripherals::Peripherals::take().unwrap();
 
-    // let mut led = PinDriver::output(peripherals.pins.gpio10).unwrap();
-    let mut led = PinDriver::output(peripherals.pins.gpio6).unwrap();
+    // LED 2812 ---------------------------------------------
+    let led_pin = peripherals.pins.gpio10;
+    let channel = peripherals.rmt.channel0;
 
+    let mut ws2812 = Ws2812Esp32RmtDriver::new(channel, led_pin).unwrap(); // GPIO 10, RMT channel 0
+
+    pub fn status_led(led: &mut Ws2812Esp32RmtDriver, col: Colors) {
+        let color = match col {
+            Colors::Red => LedPixelColorGrb24::new_with_rgb(30, 0, 0),
+            Colors::Green => LedPixelColorGrb24::new_with_rgb(0, 30, 0),
+            Colors::Blue => LedPixelColorGrb24::new_with_rgb(0, 0, 30),
+            Colors::Yellow => LedPixelColorGrb24::new_with_rgb(30, 30, 0),
+            Colors::White => LedPixelColorGrb24::new_with_rgb(30, 30, 30),
+            Colors::Black => LedPixelColorGrb24::new_with_rgb(0, 0, 0),
+        };
+        let pixel: [u8; 3] = color.as_ref().try_into().unwrap();
+        led.write_blocking(pixel.into_iter()).unwrap();
+    }
+
+    // let _led = PinDriver::output(peripherals.pins.gpio10).unwrap();
+
+    status_led(&mut ws2812, Colors::Yellow);
+
+    // ADC ---------------------------------------------
     let adc1 = peripherals.adc1;
 
-    ssn_devices.push(SsnDevice {
+    // ssn_devices.push(SsnDevice {
+    let new_device = SsnDevice {
         dev_id: "adc-test".to_string(),
         is_active: true,
         is_paused: false,
+        period: SsnSensorPeriod::Fast,
         device: SsnDevices::Adc {
             raw_value: 0,
             voltage_mv: 0.0,
             raw_value_delta: 1.0, // 1%
             raw_value_last_sent_value: Some(0),
             raw_value_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            period: SsnSensorPeriod::Fast,
             sensor: (AdcReader::new(peripherals.pins.gpio4, adc1)
                 .context("Failed to create ADC reader")?),
             delta_over: Some(50.0),
             voltage_value_last_sent_value: Some(0.0),
         },
-    });
+    };
+    SsnDevice::add_shared_device(&mut shared_devices, new_device);
 
     // let pins = peripherals.pins;
     let scl = peripherals.pins.gpio0;
     let sda = peripherals.pins.gpio1;
-
-    // LED 2812
-    let led_pin = peripherals.pins.gpio10;
-    let channel = peripherals.rmt.channel0;
-
-    // let mut ws2812 = LedPixelEsp32Rmt::<RGBW8, LedPixelColorGrbw32>::new(channel, led_pin).unwrap();
-    // Create a WS2812 driver instance
-    let mut ws2812 = Ws2812Esp32RmtDriver::new(channel, led_pin).unwrap(); // GPIO 10, RMT channel 0
-
-    // Define some colors (RGB format)
-    let red = LedPixelColorGrb24::new_with_rgb(30, 0, 0);
-    let green = LedPixelColorGrb24::new_with_rgb(0, 30, 0);
-    let blue = LedPixelColorGrb24::new_with_rgb(0, 0, 30);
 
     // // Initialize Wi-Fi
     let sysloop = EspSystemEventLoop::take()?;
@@ -297,12 +556,18 @@ fn main_logic() -> Result<()> {
         sysloop.clone(),
     )
     .map_err(|e| {
+        // let pixel: [u8; 3] = red.as_ref().try_into().unwrap();
+        // ws2812.write_blocking(pixel.clone().into_iter()).unwrap();
+        status_led(&mut ws2812, Colors::Red);
         anyhow::anyhow!(
             "WiFi init failed for SSID {}: {:?}",
             app_config.wifi_ssid,
             e
         )
     })?;
+
+    // green LED after successful WiFi:
+    status_led(&mut ws2812, Colors::Green);
 
     log::info!("Our SSID is:");
     log::info!("{}", app_config.wifi_ssid);
@@ -312,106 +577,117 @@ fn main_logic() -> Result<()> {
     let i2c = peripherals.i2c0;
     let config = I2cConfig::new().baudrate(400.kHz().into());
     let i2c_driver = I2cDriver::new(i2c, sda, scl, &config)?;
-    // let hal_i2c = i2c_driver.reverse();
 
     fn init_i2c(i2c: I2cDriver<'static>) {
-        // *I2C.lock().unwrap() = Some(i2c);
         *I2C.lock().unwrap() = Some(Arc::new(Mutex::new(i2c)));
         log::info!("I2C initialized");
     }
 
     let i2c_lock = Arc::new(Mutex::new(i2c_driver));
 
-    // let shared_i2c = SharedI2c::new(i2c_lock); // Your wrapper implementing `I2c`
     let shared_i2c = SharedI2c::new(i2c_lock.clone()); // Your wrapper implementing `I2c`
 
-    // Initialize AHT21 sensor
-    let mut aht21 = AHT21Sensor::new(shared_i2c.clone()).unwrap();
+    // // Initialize AHT21 sensor
+    // let mut aht21 = AHT21Sensor::new(shared_i2c.clone()).unwrap();
 
-    // Read sensor data
-    let (temperature, humidity) = aht21.get_data().unwrap();
-    log::info!("temperature (aht21): {:.2}C", temperature);
-    log::info!("humidity (aht21): {:.2}%", humidity);
+    // // Read sensor data
+    // let (temperature, humidity) = aht21.get_data().unwrap();
+    // log::info!("temperature (aht21): {:.2}C", temperature);
+    // log::info!("humidity (aht21): {:.2}%", humidity);
 
-    ssn_devices.push(SsnDevice {
-        dev_id: "aht21-test".to_string(),
-        is_active: true,
-        is_paused: false,
-        device: SsnDevices::Aht21 {
-            temperature: 0.0,
-            temperature_delta: 0.5, // 0.5%
-            temperature_last_sent_value: None,
-            temperature_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            humidity: 0.0,
-            humidity_delta: 0.5, // 0.5%
-            humidity_last_sent_value: None,
-            humidity_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            period: SsnSensorPeriod::Slow,
-            sensor: AHT21Sensor::new(SharedI2c::new(i2c_lock.clone())).unwrap(),
-            temperature_delta_over: Some(30.0),
-            humidity_delta_over: Some(30.0),
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "aht21-test".to_string(),
+            period: SsnSensorPeriod::Middle,
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::Aht21 {
+                temperature: 0.0,
+                temperature_delta: 0.5, // 0.5%
+                temperature_last_sent_value: None,
+                temperature_last_update: Instant::now()
+                    - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                humidity: 0.0,
+                humidity_delta: 0.5, // 0.5%
+                humidity_last_sent_value: None,
+                humidity_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                sensor: AHT21Sensor::new(SharedI2c::new(i2c_lock.clone())).unwrap(),
+                temperature_delta_over: Some(30.0),
+                humidity_delta_over: Some(30.0),
+            },
         },
-    });
+    );
 
-    ssn_devices.push(SsnDevice {
-        dev_id: "ens160-test".to_string(),
-        is_active: true,
-        is_paused: false,
-        device: SsnDevices::Ens160 {
-            co2eq_ppm: (-1),
-            co2eq_delta: (5.0),
-            co2eq_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            co2eq_last_sent_value: None,
-            tvoc_ppb: (-1),
-            tvoc_delta: (2.0),
-            tvoc_last_update: (Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30)),
-            tvoc_last_sent_value: None,
-            aqi: (-1),
-            aqi_delta: (1.0),
-            aqi_last_update: (Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30)),
-            aqi_last_sent_value: None,
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "ens160-test".to_string(),
             period: SsnSensorPeriod::Slow,
-            sensor: ens160::ENS160Sensor::new(shared_i2c).unwrap(),
-            co2eq_delta_over: Some(50.0),
-            tvoc_delta_over: Some(50.0),
-            aqi_delta_over: Some(50.0),
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::Ens160 {
+                co2eq_ppm: (-1),
+                co2eq_delta: (5.0),
+                co2eq_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                co2eq_last_sent_value: None,
+                tvoc_ppb: (-1),
+                tvoc_delta: (2.0),
+                tvoc_last_update: (Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30)),
+                tvoc_last_sent_value: None,
+                aqi: (-1),
+                aqi_delta: (1.0),
+                aqi_last_update: (Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30)),
+                aqi_last_sent_value: None,
+                sensor: ens160::ENS160Sensor::new(shared_i2c).unwrap(),
+                co2eq_delta_over: Some(20.0),
+                tvoc_delta_over: Some(20.0),
+                aqi_delta_over: Some(30.0),
+            },
         },
-    });
+    );
 
-    ssn_devices.push(SsnDevice {
-        dev_id: "bmp180-test".to_string(),
-        is_active: true,
-        is_paused: false,
-        device: SsnDevices::Bmp180 {
-            temperature: (0.0),
-            temperature_delta: 0.5, // 0.5%
-            temperature_last_sent_value: None,
-            temperature_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            pressure: (0),
-            pressure_delta: 0.5, // 0.5%
-            pressure_last_sent_value: None,
-            pressure_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            altitude: (0.0),
-            period: SsnSensorPeriod::Slow,
-            sensor: (bmp180::BMP180Sensor::new(SharedI2c::new(i2c_lock.clone()), FreeRtos)?),
-            temperature_delta_over: Some(30.0),
-            pressure_delta_over: Some(12.0),
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "bmp180-test".to_string(),
+            period: SsnSensorPeriod::Middle,
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::Bmp180 {
+                temperature: (0.0),
+                temperature_delta: 0.5, // 0.5%
+                temperature_last_sent_value: None,
+                temperature_last_update: Instant::now()
+                    - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                pressure: (0),
+                pressure_delta: 0.5, // 0.5%
+                pressure_last_sent_value: None,
+                pressure_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                altitude: (0.0),
+                sensor: (bmp180::BMP180Sensor::new(SharedI2c::new(i2c_lock.clone()), FreeRtos)?),
+                temperature_delta_over: Some(30.0),
+                pressure_delta_over: Some(10.0),
+            },
         },
-    });
+    );
 
-    ssn_devices.push(SsnDevice {
-        dev_id: "store_int-test".to_string(),
-        is_active: true,
-        is_paused: false,
-        device: SsnDevices::StoreInt {
-            data: (10),
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "store_int-test".to_string(),
             period: SsnSensorPeriod::Fast,
-            delta: 0.5,
-            last_sent_value: None,
-            last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            delta_over: Some(30.0),
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::StoreInt {
+                data: (10),
+                delta: 1.0,
+                last_sent_value: None,
+                last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                delta_over: None,
+            },
         },
-    });
+    );
 
     // MQTT Client configuration *******************************************************
 
@@ -420,10 +696,13 @@ fn main_logic() -> Result<()> {
 
     let topics_to_subscribe = vec![
         format!("/ssn/acc/{}/raw_data", &account),
-        format!("/ssn/acc/{}/obj/+/commands", &account),
-        format!("/ssn/acc/{}/obj/+/commands/ini", &account),
-        format!("/ssn/acc/{}/obj/+/commands/json", &account),
-        format!("/ssn/acc/{}/obj/+/commands/device/+/+/in", &account),
+        format!("/ssn/acc/{}/obj/{}/commands", &account, &object),
+        format!("/ssn/acc/{}/obj/{}/commands/ini", &account, &object),
+        format!("/ssn/acc/{}/obj/{}/commands/json", &account, &object),
+        format!(
+            "/ssn/acc/{}/obj/{}/commands/device/+/+/in",
+            &account, &object
+        ),
     ];
 
     let broker_url = if !app_config.mqtt_user.is_empty() {
@@ -442,7 +721,7 @@ fn main_logic() -> Result<()> {
         ..Default::default()
     };
 
-    log::info!("Hello, world!");
+    log::info!("SSN. Hello world!");
 
     // let mut client = EspMqttClient::new_cb(&broker_url, &mqtt_config, move |_message_event| {})?;
     // let (mut client, mut connection) = EspMqttClient::new(&broker_url, &mqtt_config)?;
@@ -451,6 +730,33 @@ fn main_logic() -> Result<()> {
             EventPayload::Received { data, topic, .. } => {
                 log::info!("Received message on {:?}: {:?}", topic, data);
                 mqtt_messages::process_message(topic, data);
+                let float_str = std::str::from_utf8(data).unwrap(); // Convert to string
+                match float_str.parse::<f32>() {
+                    Ok(val) => {
+                        log::info!("Parsed float: {}", val);
+                        let _ = push_command(
+                            &commands_array_ref.clone(),
+                            SsnDeviceCommand {
+                                dev_id: ("store_int-test".to_owned()),
+                                channel: (0),
+                                value: val,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        log::info!("Error parsing float: {}", e)
+                    }
+                }
+
+                if let Some(vals) = get_sensor_values(&shared_data.clone(), "aht21-test") {
+                    log::info!("sensor val: {:?}", vals);
+                };
+                // let value = read_device_value(&shared_devices[0], 0);
+                // let sensor1 = SsnDevice::get_device_by_id(&shared_devices, "aht21-test");
+                // if let Some(sensor) = sensor1 {
+                //     log::info!("sensor val: {:?}", read_device_value(&sensor, 0));
+                // }
+                // SsnDevices::get_value_by_channel(&ssn_devices, "aht21-test", 0);
             }
             EventPayload::Subscribed(id) => info!("Subscribed to id: {}", id),
             EventPayload::Disconnected => {
@@ -480,7 +786,7 @@ fn main_logic() -> Result<()> {
         }
     })?;
 
-    std::thread::sleep(Duration::from_millis(3000));
+    std::thread::sleep(Duration::from_millis(4000));
     // Subscribe to topics
     for topic in topics_to_subscribe {
         info!("MQTT subscribe to {}", &topic);
@@ -523,12 +829,42 @@ fn main_logic() -> Result<()> {
 
     log::info!("Http server awaiting connection");
 
-    // ********************* main loop
+    // preinit time counters:
+    // let mut time_counter_freq = Instant::now();
+    let mut time_counter_middle = Instant::now();
+    let mut time_counter_seldom = Instant::now();
 
+    fn is_fire_measurement(
+        dev_period: &SsnSensorPeriod,
+        time_counter_middle: &mut Instant,
+        time_counter_seldom: &mut Instant,
+    ) -> bool {
+        match dev_period {
+            SsnSensorPeriod::Slow => {
+                if time_counter_seldom.elapsed() > Duration::from_millis(SLOW_LOOP_PERIOD_MS) {
+                    log::info!("fire seldom {:?}", time_counter_seldom);
+                    return true;
+                }
+            }
+            SsnSensorPeriod::Middle => {
+                if time_counter_middle.elapsed() > Duration::from_millis(MIDDLE_LOOP_PERIOD_MS) {
+                    log::info!("fire middle {:?}", time_counter_middle);
+                    return true;
+                }
+            }
+            SsnSensorPeriod::Fast => {
+                return true;
+            }
+        }
+        false
+    }
+
+    // ********************* main loop ****************************
     loop {
         // Check WiFi connection status
         if !ssn_wifi::check_wifi_connection(my_wifi.wifi()) {
             log::warn!("WiFi connection lost. Attempting to reconnect...");
+            status_led(&mut ws2812, Colors::Red);
 
             my_wifi.stop()?;
             my_wifi.start()?;
@@ -541,352 +877,396 @@ fn main_logic() -> Result<()> {
             }
         }
 
-        led.set_high().unwrap(); // Turn the LED on
-        println!("LED ON");
-        // Set all LEDs to red
-        let pixel: [u8; 3] = green.as_ref().try_into().unwrap();
-        ws2812.write_blocking(pixel.clone().into_iter()).unwrap();
+        log::info!("New measurment circle ..");
+        let now = Instant::now();
+        // log::info!(
+        //     "now = {:?},
+        //     \ntime_counter_middle = {:?} \ntime_counter_seldom = {:?}",
+        //     &now,
+        //     &time_counter_middle,
+        //     &time_counter_seldom
+        // );
+        status_led(&mut ws2812, Colors::Blue);
 
-        FreeRtos::delay_ms(2000);
+        // FreeRtos::delay_ms(2000);
+        let (command_dev_id, command_channel, command_value) =
+            if let Some(command) = pop_command(&commands_array) {
+                log::info!(
+                    "pop_command: dev={}, channel={}, val={}",
+                    command.dev_id,
+                    command.channel,
+                    command.value
+                );
+                (command.dev_id, command.channel, command.value)
+            } else {
+                ("".to_string(), 0, 0.0)
+            };
+
+        // log::info!(
+        //     "pop_command: command_dev_id={}, command_channel={}, command_value={}",
+        //     command_dev_id,
+        //     command_channel,
+        //     command_value
+        // );
 
         // iterate through all devices, refresh their data and publish it:
-        for cur_device in &mut ssn_devices {
+        shared_devices.iter().for_each(|device| {
+            let mut cur_device = device.lock().unwrap(); // Blocks until lock acquired
             let dev = cur_device.dev_id.to_string();
-            let now = Instant::now();
 
-            match &mut cur_device.device {
-                SsnDevices::Adc {
-                    sensor,
-                    raw_value,
-                    voltage_mv,
-                    raw_value_delta,
-                    delta_over,
-                    raw_value_last_update,
-                    raw_value_last_sent_value,
-                    voltage_value_last_sent_value,
-                    ..
-                } => {
-                    let (new_raw, new_voltage) = sensor.read().unwrap();
 
-                    // Calculate percentage changes
-                    let raw_change_pct =
-                        calculate_percentage_change(new_raw as f32, *raw_value as f32);
-                    let voltage_change_pct = calculate_percentage_change(new_voltage, *voltage_mv);
+            // check measure or not in this circle:
+            if is_fire_measurement(&cur_device.period, &mut time_counter_middle, &mut time_counter_seldom) {
 
-                    log::info!(
-                        "New: Raw={:.2}, Voltage={}, delta_Raw(%)={:.4}, delta_Voltage(%)={:.5}",
+                match &mut cur_device.device {
+                    SsnDevices::Adc {
+                        sensor,
                         raw_value,
                         voltage_mv,
-                        raw_change_pct,
-                        voltage_change_pct
-                    );
-
-                    *raw_value = new_raw;
-                    *voltage_mv = new_voltage;
-
-                    // Handle voltage update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *voltage_mv,
-                        voltage_value_last_sent_value,
-                        raw_value_last_update,
-                        voltage_change_pct,
                         raw_value_delta,
-                        delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
-                        "adc-voltage",
-                    )?;
-                    // Handle raw update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *raw_value,
+                        delta_over,
+                        raw_value_last_update,
                         raw_value_last_sent_value,
-                        raw_value_last_update,
-                        raw_change_pct,
-                        raw_value_delta,
-                        delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
-                        "adc-raw",
-                    )?;
-                }
-                SsnDevices::Bmp180 {
-                    sensor,
-                    temperature,
-                    pressure,
-                    altitude,
-                    temperature_delta,
-                    temperature_delta_over,
-                    temperature_last_update,
-                    temperature_last_sent_value,
-                    pressure_last_update,
-                    pressure_last_sent_value,
-                    pressure_delta,
-                    pressure_delta_over,
-                    ..
-                } => {
-                    log::info!(
-                        "Old: temperature={:.2}, pressure={}, altitude={}",
+                        voltage_value_last_sent_value,
+                        ..
+                    } => {
+                        let (new_raw, new_voltage) = sensor.read().unwrap();
+
+                        // Calculate percentage changes
+                        let raw_change_pct =
+                            calculate_percentage_change(new_raw as f32, *raw_value as f32);
+                        let voltage_change_pct = calculate_percentage_change(new_voltage, *voltage_mv);
+
+                        log::info!(
+                            "adc: Raw={:.2}, Voltage={}, delta_Raw(%)={:.4}, delta_Voltage(%)={:.5}",
+                            raw_value,
+                            voltage_mv,
+                            raw_change_pct,
+                            voltage_change_pct
+                        );
+
+                        *raw_value = new_raw;
+                        *voltage_mv = new_voltage;
+
+                        // Handle voltage update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *voltage_mv,
+                            voltage_value_last_sent_value,
+                            raw_value_last_update,
+                            voltage_change_pct,
+                            raw_value_delta,
+                            delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            "adc-voltage",
+                        );
+                        // Handle raw update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *raw_value,
+                            raw_value_last_sent_value,
+                            raw_value_last_update,
+                            raw_change_pct,
+                            raw_value_delta,
+                            delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
+                            "adc-raw",
+                        );
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![*voltage_mv, *raw_value as f32]);
+                    }
+                    SsnDevices::Bmp180 {
+                        sensor,
                         temperature,
                         pressure,
-                        altitude
-                    );
-                    let (new_temp, new_pressure, new_alt) =
-                        sensor.get_data().context("bmp180 read data error").unwrap();
-
-                    // Calculate percentage changes
-                    let temp_change_pct = calculate_percentage_change(new_temp, *temperature);
-                    let pressure_change_pct =
-                        calculate_percentage_change(new_pressure as f32, *pressure as f32);
-
-                    log::info!(
-                        "New: temperature={:.2}, pressure={}, altitude={}, delta_temperature(%)={:.4}, delta_pressure(%)={:.5}",
-                        new_temp,
-                        new_pressure,
-                        new_alt,
-                        temp_change_pct,
-                        pressure_change_pct
-                    );
-
-                    // Update stored values
-                    *temperature = new_temp;
-                    *pressure = new_pressure;
-                    *altitude = new_alt;
-
-                    // Handle temperature update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *temperature,
-                        temperature_last_sent_value,
-                        temperature_last_update,
-                        temp_change_pct,
+                        altitude,
                         temperature_delta,
-                        temperature_delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
-                        "bmp180-temperature",
-                    )?;
-
-                    // Handle pressure update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *pressure,
-                        pressure_last_sent_value,
+                        temperature_delta_over,
+                        temperature_last_update,
+                        temperature_last_sent_value,
                         pressure_last_update,
-                        pressure_change_pct,
+                        pressure_last_sent_value,
                         pressure_delta,
-                        pressure_delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
-                        "bmp180-pressure",
-                    )?;
-                }
-                SsnDevices::StoreInt {
-                    period,
-                    data,
-                    delta,
-                    delta_over,
-                    last_update,
-                    last_sent_value,
-                    ..
-                } => {
-                    // ... similar implementation for StoreInt
-                    let new_value = *data;
-                    // Calculate percentage changes
-                    let change_pct = calculate_percentage_change(new_value as f32, *data as f32);
+                        pressure_delta_over,
+                        ..
+                    } => {
+                        log::info!(
+                            "Old: temperature={:.2}, pressure={}, altitude={}",
+                            temperature,
+                            pressure,
+                            altitude
+                        );
+                        let (new_temp, new_pressure, new_alt) =
+                            sensor.get_data().context("bmp180 read data error").unwrap();
 
-                    // Handle co2eq update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *data,
-                        last_sent_value,
-                        last_update,
-                        change_pct,
+                        // Calculate percentage changes
+                        let temp_change_pct = calculate_percentage_change(new_temp, *temperature);
+                        let pressure_change_pct =
+                            calculate_percentage_change(new_pressure as f32, *pressure as f32);
+
+                        log::info!(
+                            "bmp180 New: temperature={:.2}, pressure={}, altitude={}, delta_temperature(%)={:.4}, delta_pressure(%)={:.5}",
+                            new_temp,
+                            new_pressure,
+                            new_alt,
+                            temp_change_pct,
+                            pressure_change_pct
+                        );
+
+                        // Update stored values
+                        *temperature = new_temp;
+                        *pressure = new_pressure;
+                        *altitude = new_alt;
+
+                        // Handle temperature update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *temperature,
+                            temperature_last_sent_value,
+                            temperature_last_update,
+                            temp_change_pct,
+                            temperature_delta,
+                            temperature_delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            "bmp180-temperature",
+                        );
+
+                        // Handle pressure update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *pressure,
+                            pressure_last_sent_value,
+                            pressure_last_update,
+                            pressure_change_pct,
+                            pressure_delta,
+                            pressure_delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
+                            "bmp180-pressure",
+                        );
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![*temperature, *pressure as f32]);
+                    }
+                    SsnDevices::StoreInt {
+                        data,
                         delta,
-                        delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
-                        "storeInt",
-                    )?;
-
-                    *data = new_value;
-                }
-                SsnDevices::Ens160 {
-                    sensor,
-                    co2eq_ppm,
-                    tvoc_ppb,
-                    aqi,
-                    co2eq_delta,
-                    co2eq_delta_over,
-                    tvoc_delta,
-                    tvoc_delta_over,
-                    aqi_delta,
-                    aqi_delta_over,
-                    co2eq_last_update,
-                    tvoc_last_update,
-                    aqi_last_update,
-                    co2eq_last_sent_value,
-                    tvoc_last_sent_value,
-                    aqi_last_sent_value,
-                    ..
-                } => {
-                    let (new_co2eq, new_tvoc, new_aqi) = sensor.get_data().unwrap_or((-1, -1, -1));
-
-                    // Calculate percentage changes
-                    let co2eq_change_pct =
-                        calculate_percentage_change(new_co2eq as f32, *co2eq_ppm as f32);
-                    let tvoc_change_pct =
-                        calculate_percentage_change(new_tvoc as f32, *tvoc_ppb as f32);
-                    let aqi_change_pct = calculate_percentage_change(new_aqi as f32, *aqi as f32);
-
-                    log::info!(
-                        "ENS160 - CO₂eq: {} ppm (Δ {:.2}%), TVOC: {} ppb (Δ {:.2}%), AQI: {} (Δ {:.2}%)",
-                        new_co2eq,
-                        co2eq_change_pct,
-                        new_tvoc,
-                        tvoc_change_pct,
-                        new_aqi,
-                        aqi_change_pct
-                    );
-
-                    // Update stored values
-                    *co2eq_ppm = new_co2eq;
-                    *tvoc_ppb = new_tvoc;
-                    *aqi = new_aqi;
-
-                    // Handle co2eq update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *co2eq_ppm,
-                        co2eq_last_sent_value,
-                        co2eq_last_update,
-                        co2eq_change_pct,
-                        co2eq_delta,
-                        co2eq_delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
-                        "Ens160-co2eq",
-                    )?;
-                    // Handle co2eq update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *tvoc_ppb,
-                        tvoc_last_sent_value,
-                        tvoc_last_update,
-                        tvoc_change_pct,
-                        tvoc_delta,
-                        tvoc_delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
-                        "Ens160-tvoc",
-                    )?; // Handle co2eq update
-                    handle_sensor_value_update(
-                        &mut client,
-                        *aqi,
-                        aqi_last_sent_value,
-                        aqi_last_update,
-                        aqi_change_pct,
-                        aqi_delta,
-                        aqi_delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "2"),
-                        "Ens160-aqi",
-                    )?;
-                }
-                SsnDevices::Aht21 {
-                    temperature,
-                    temperature_delta,
-                    temperature_delta_over,
-                    temperature_last_update,
-                    temperature_last_sent_value,
-                    humidity,
-                    humidity_delta,
-                    humidity_delta_over,
-                    humidity_last_update,
-                    humidity_last_sent_value,
-                    sensor,
-                    period,
-                } => {
-                    log::info!(
-                        "Old: temperature={:.2}°C, humidity={:.2}%",
-                        temperature,
-                        humidity
-                    );
-
-                    // Read sensor data with error handling
-                    let (new_temp, new_humidity) = match sensor.get_data() {
-                        Ok(data) => data,
-                        Err(e) => {
-                            log::error!("AHT21 read failed: {:?}", e);
-                            continue; // Skip this iteration if reading fails
+                        delta_over,
+                        last_update,
+                        last_sent_value,
+                        ..
+                    } => {
+                        let mut new_value = *data;
+                        // check set value for StoreInt
+                        if dev.eq(&command_dev_id) {
+                            log::info!("set value StoreInt {}", command_value);
+                            new_value = command_value as i32;
                         }
-                    };
+                        // Calculate percentage changes
+                        let change_pct = calculate_percentage_change(new_value as f32, *data as f32);
+                        *data = new_value;
 
-                    // Calculate percentage changes
-                    let temperature_change_pct =
-                        calculate_percentage_change(new_temp as f32, *temperature as f32);
-                    let humidity_change_pct =
-                        calculate_percentage_change(new_humidity as f32, *humidity as f32);
+                        // Handle co2eq update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *data,
+                            last_sent_value,
+                            last_update,
+                            change_pct,
+                            delta,
+                            delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            "storeInt",
+                        );
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![*data as f32]);
 
-                    log::info!(
-                        "New: temperature={:.2}°C (Δ {:.2}%), humidity={:.2}% (Δ {:.2}%)",
-                        new_temp,
-                        temperature_change_pct,
-                        new_humidity,
-                        humidity_change_pct
-                    );
+                    }
+                    SsnDevices::Ens160 {
+                        sensor,
+                        co2eq_ppm,
+                        tvoc_ppb,
+                        aqi,
+                        co2eq_delta,
+                        co2eq_delta_over,
+                        tvoc_delta,
+                        tvoc_delta_over,
+                        aqi_delta,
+                        aqi_delta_over,
+                        co2eq_last_update,
+                        tvoc_last_update,
+                        aqi_last_update,
+                        co2eq_last_sent_value,
+                        tvoc_last_sent_value,
+                        aqi_last_sent_value,
+                        ..
+                    } => {
+                        let (new_co2eq, new_tvoc, new_aqi) = sensor.get_data().unwrap_or((-1, -1, -1));
 
-                    // Update values
-                    *temperature = new_temp;
-                    *humidity = new_humidity;
+                        // Calculate percentage changes
+                        let co2eq_change_pct =
+                            calculate_percentage_change(new_co2eq as f32, *co2eq_ppm as f32);
+                        let tvoc_change_pct =
+                            calculate_percentage_change(new_tvoc as f32, *tvoc_ppb as f32);
+                        let aqi_change_pct = calculate_percentage_change(new_aqi as f32, *aqi as f32);
 
-                    handle_sensor_value_update(
-                        &mut client,
-                        *temperature,
-                        temperature_last_sent_value,
-                        temperature_last_update,
-                        temperature_change_pct,
+                        log::info!(
+                            "ENS160 - CO₂eq: {} ppm (Δ {:.2}%), TVOC: {} ppb (Δ {:.2}%), AQI: {} (Δ {:.2}%)",
+                            new_co2eq,
+                            co2eq_change_pct,
+                            new_tvoc,
+                            tvoc_change_pct,
+                            new_aqi,
+                            aqi_change_pct
+                        );
+
+                        // Update stored values
+                        *co2eq_ppm = new_co2eq;
+                        *tvoc_ppb = new_tvoc;
+                        *aqi = new_aqi;
+
+                        // Handle co2eq update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *co2eq_ppm,
+                            co2eq_last_sent_value,
+                            co2eq_last_update,
+                            co2eq_change_pct,
+                            co2eq_delta,
+                            co2eq_delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            "Ens160-co2eq",
+                        );
+                        // Handle co2eq update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *tvoc_ppb,
+                            tvoc_last_sent_value,
+                            tvoc_last_update,
+                            tvoc_change_pct,
+                            tvoc_delta,
+                            tvoc_delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
+                            "Ens160-tvoc",
+                        ); // Handle co2eq update
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *aqi,
+                            aqi_last_sent_value,
+                            aqi_last_update,
+                            aqi_change_pct,
+                            aqi_delta,
+                            aqi_delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "2"),
+                            "Ens160-aqi",
+                        );
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![*co2eq_ppm as f32, *tvoc_ppb as f32, *aqi  as f32]);
+                    }
+                    SsnDevices::Aht21 {
+                        temperature,
                         temperature_delta,
-                        temperature_delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
-                        "aht21-temperature",
-                    )?;
-                    handle_sensor_value_update(
-                        &mut client,
-                        *humidity,
-                        humidity_last_sent_value,
-                        humidity_last_update,
-                        humidity_change_pct,
+                        temperature_delta_over,
+                        temperature_last_update,
+                        temperature_last_sent_value,
+                        humidity,
                         humidity_delta,
-                        humidity_delta_over.as_ref(),
-                        now,
-                        Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                        &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
-                        "aht21-temperature",
-                    )?;
+                        humidity_delta_over,
+                        humidity_last_update,
+                        humidity_last_sent_value,
+                        sensor,
+                    } => {
+                        log::info!(
+                            "aht21 Old: temperature={:.2}°C, humidity={:.2}%",
+                            temperature,
+                            humidity
+                        );
+
+                        // Read sensor data with error handling
+                        let (new_temp, new_humidity) = sensor.get_data().unwrap();
+                        //  {
+                        //     Ok(data) => data,
+                        //     // Err(e) => {
+                        //     //     log::error!("AHT21 read failed: {:?}", e);
+                        //     //     // continue; // Skip this iteration if reading fails
+                        //     // }
+                        // };
+
+                        // Calculate percentage changes
+                        let temperature_change_pct =
+                            calculate_percentage_change(new_temp, *temperature);
+                        let humidity_change_pct =
+                            calculate_percentage_change(new_humidity, *humidity);
+
+                        log::info!(
+                            "aht21 New: temperature={:.2}°C (Δ {:.2}%), humidity={:.2}% (Δ {:.2}%)",
+                            new_temp,
+                            temperature_change_pct,
+                            new_humidity,
+                            humidity_change_pct
+                        );
+
+                        // Update values
+                        *temperature = new_temp;
+                        *humidity = new_humidity;
+
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *temperature,
+                            temperature_last_sent_value,
+                            temperature_last_update,
+                            temperature_change_pct,
+                            temperature_delta,
+                            temperature_delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            "aht21-temperature",
+                        );
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *humidity,
+                            humidity_last_sent_value,
+                            humidity_last_update,
+                            humidity_change_pct,
+                            humidity_delta,
+                            humidity_delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
+                            "aht21-humidity",
+                        );
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![*temperature, *humidity]);
+                    }
                 }
+                // little pause between measurments
+                FreeRtos::delay_ms(500); // Wait 500ms
             }
-            // little pause between measurments
-            FreeRtos::delay_ms(500); // Wait 500ms
         }
+    );
+        // led.set_low().unwrap();
+        println!("Measurment circle finished");
 
-        led.set_low().unwrap(); // Turn the LED off
-        println!("LED OFF");
+        // Set LED to green again
+        status_led(&mut ws2812, Colors::Green);
 
-        // Set all LEDs to blue
-        let pixel: [u8; 3] = blue.as_ref().try_into().unwrap();
-        ws2812.write_blocking(pixel.clone().into_iter()).unwrap();
+        // reset time counters if needed:
+        if now.duration_since(time_counter_seldom) > Duration::from_millis(SLOW_LOOP_PERIOD_MS) {
+            time_counter_seldom = Instant::now();
+        }
+        if now.duration_since(time_counter_middle) > Duration::from_millis(MIDDLE_LOOP_PERIOD_MS) {
+            time_counter_middle = Instant::now();
+        }
 
         FreeRtos::delay_ms(1500); // Wait 500ms
     }

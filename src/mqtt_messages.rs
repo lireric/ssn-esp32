@@ -10,7 +10,7 @@ use std::{
 use crate::commons::ValuesDev;
 
 pub fn status_topic(acc: &str, obj: &str, event: &str) -> String {
-    format!("/ssn/acc/{}/obj/{}/{}", acc, obj, event)
+    format!("/ssn/acc/{}/obj/{}/status/{}", acc, obj, event)
 }
 
 pub fn publish_sensor_topic(acc: &str, obj: &str, dev: &str, channel: &str) -> String {
