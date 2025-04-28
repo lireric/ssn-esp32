@@ -20,8 +20,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            account: "2".to_string(),
-            object: "esp32-test".to_string(),
+            account: "3".to_string(),
+            object: "2".to_string(), // esp32-test
             mqtt_host: "192.168.1.105".to_string(),
             mqtt_user: "mosquitto".to_string(),
             mqtt_pass: "test".to_string(),

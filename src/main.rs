@@ -82,7 +82,7 @@ const MAX_PERIOD_REFRESH_MQTT: u64 = 60; // sec.
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const RECONNECT_DELAY_MS: u64 = 5000;
 const MAIN_LOOP_DELAY_MS: u64 = 100;
-const MIDDLE_LOOP_PERIOD_MS: u64 = 10000;
+const MIDDLE_LOOP_PERIOD_MS: u64 = 20000;
 const SLOW_LOOP_PERIOD_MS: u64 = 60000;
 
 lazy_static! {
@@ -201,11 +201,11 @@ enum SsnDevices<P: ADCPin<Adc = ADC1>> {
         sensor: AHT21Sensor<SharedI2c>,
     },
     StoreInt {
-        data: i32,
+        data: HashMap<String, i32>,
         delta: f32,
         delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
-        last_update: Instant,
-        last_sent_value: Option<i32>,
+        last_update: HashMap<String, Instant>,
+        last_sent_value: HashMap<String, Option<i32>>,
     },
 }
 
@@ -214,139 +214,6 @@ pub struct SsnChannelInfo {
     pub index: usize,
     pub name: &'static str,
     pub description: &'static str,
-}
-
-impl<P: ADCPin<Adc = ADC1>> SsnDevice<P> {
-    pub fn get_channels(&self) -> Vec<SsnChannelInfo> {
-        match &self.device {
-            SsnDevices::Bmp180 { .. } => vec![
-                SsnChannelInfo {
-                    index: 0,
-                    name: "temperature",
-                    description: "Temperature in °C",
-                },
-                SsnChannelInfo {
-                    index: 1,
-                    name: "pressure",
-                    description: "Pressure in hPa",
-                },
-                SsnChannelInfo {
-                    index: 2,
-                    name: "altitude",
-                    description: "Altitude in meters",
-                },
-            ],
-            SsnDevices::Ens160 { .. } => vec![
-                SsnChannelInfo {
-                    index: 0,
-                    name: "co2",
-                    description: "CO2 equivalent in ppm",
-                },
-                SsnChannelInfo {
-                    index: 1,
-                    name: "tvoc",
-                    description: "TVOC in ppb",
-                },
-                SsnChannelInfo {
-                    index: 2,
-                    name: "aqi",
-                    description: "Air Quality Index",
-                },
-            ],
-            SsnDevices::Adc { .. } => vec![
-                SsnChannelInfo {
-                    index: 0,
-                    name: "voltage",
-                    description: "Voltage in mV",
-                },
-                SsnChannelInfo {
-                    index: 1,
-                    name: "raw",
-                    description: "Raw ADC value",
-                },
-            ],
-            SsnDevices::Aht21 { .. } => vec![
-                SsnChannelInfo {
-                    index: 0,
-                    name: "temperature",
-                    description: "Temperature in °C",
-                },
-                SsnChannelInfo {
-                    index: 1,
-                    name: "humidity",
-                    description: "Humidity in %",
-                },
-            ],
-            SsnDevices::StoreInt { .. } => vec![SsnChannelInfo {
-                index: 0,
-                name: "value",
-                description: "Stored integer value",
-            }],
-        }
-    }
-    // Return real channel by it name or 0
-    pub fn get_channel_by_name(&self, name: &str) -> usize {
-        self.get_channels()
-            .into_iter()
-            .find(|c| c.name == name)
-            .map(|c| c.index)
-            .unwrap_or(0)
-    }
-
-    pub fn get_value_by_channel(&self, channel: usize) -> Option<f32> {
-        let channel = self
-            .get_channels()
-            .into_iter()
-            .find(|c| c.index == channel)?
-            .name;
-
-        match &self.device {
-            SsnDevices::Bmp180 {
-                temperature,
-                pressure,
-                altitude,
-                ..
-            } => match channel {
-                "temperature" => Some(*temperature),
-                "pressure" => Some(*pressure as f32),
-                "altitude" => Some(*altitude),
-                _ => None,
-            },
-            SsnDevices::Ens160 {
-                co2eq_ppm,
-                tvoc_ppb,
-                aqi,
-                ..
-            } => match channel {
-                "co2" => Some(*co2eq_ppm as f32),
-                "tvoc" => Some(*tvoc_ppb as f32),
-                "aqi" => Some(*aqi as f32),
-                _ => None,
-            },
-            SsnDevices::Adc {
-                voltage_mv,
-                raw_value,
-                ..
-            } => match channel {
-                "voltage" => Some(*voltage_mv),
-                "raw" => Some(*raw_value as f32),
-                _ => None,
-            },
-            SsnDevices::Aht21 {
-                temperature,
-                humidity,
-                ..
-            } => match channel {
-                "temperature" => Some(*temperature),
-                "humidity" => Some(*humidity),
-                _ => None,
-            },
-            SsnDevices::StoreInt { data, .. } => match channel {
-                "value" => Some(*data as f32),
-                _ => None,
-            },
-        }
-    }
 }
 
 impl<P: ADCPin<Adc = ADC1>> SsnDevices<P> {
@@ -488,6 +355,7 @@ fn main_logic() -> Result<()> {
     let (app_config, app_config_size) = settings::get_config(nvs);
     let object = app_config.object.clone();
     let account = app_config.account.clone();
+    let account_ref = app_config.account.clone();
 
     log::info!(
         "Retrieved config: {}, size={}",
@@ -651,7 +519,7 @@ fn main_logic() -> Result<()> {
         &mut shared_devices,
         SsnDevice {
             dev_id: "bmp180-test".to_string(),
-            period: SsnSensorPeriod::Middle,
+            period: SsnSensorPeriod::Slow,
             is_active: true,
             is_paused: false,
             device: SsnDevices::Bmp180 {
@@ -666,8 +534,8 @@ fn main_logic() -> Result<()> {
                 pressure_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
                 altitude: (0.0),
                 sensor: (bmp180::BMP180Sensor::new(SharedI2c::new(i2c_lock.clone()), FreeRtos)?),
-                temperature_delta_over: Some(30.0),
-                pressure_delta_over: Some(10.0),
+                temperature_delta_over: Some(10.0),
+                pressure_delta_over: Some(5.0),
             },
         },
     );
@@ -680,10 +548,10 @@ fn main_logic() -> Result<()> {
             is_active: true,
             is_paused: false,
             device: SsnDevices::StoreInt {
-                data: (10),
+                data: HashMap::new(),
                 delta: 1.0,
-                last_sent_value: None,
-                last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                last_sent_value: HashMap::new(),
+                last_update: HashMap::new(),
                 delta_over: None,
             },
         },
@@ -727,26 +595,70 @@ fn main_logic() -> Result<()> {
     // let (mut client, mut connection) = EspMqttClient::new(&broker_url, &mqtt_config)?;
     let mut client = EspMqttClient::new_cb(&broker_url, &mqtt_config, move |message_event| {
         match message_event.payload() {
+//                                     ********************************* process receive data from topic:
             EventPayload::Received { data, topic, .. } => {
                 log::info!("Received message on {:?}: {:?}", topic, data);
-                mqtt_messages::process_message(topic, data);
-                let float_str = std::str::from_utf8(data).unwrap(); // Convert to string
-                match float_str.parse::<f32>() {
-                    Ok(val) => {
-                        log::info!("Parsed float: {}", val);
-                        let _ = push_command(
-                            &commands_array_ref.clone(),
-                            SsnDeviceCommand {
-                                dev_id: ("store_int-test".to_owned()),
-                                channel: (0),
-                                value: val,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        log::info!("Error parsing float: {}", e)
-                    }
+                if let Some(topic) = topic {
+                    // mqtt_messages::process_message(topic, data);
+                    // let (account_rcv, root_token, subtokens) = mqtt_messages::parse_topic(&topic);
+
+                    let float_str = std::str::from_utf8(data).unwrap(); // Convert to string
+                    if let Some((account_rcv, root_token, subtokens)) = mqtt_messages::parse_topic(topic) {
+                        log::info!("account_rcv = {}, root_token = {}, subtokens = {:?}", account_rcv, root_token, subtokens);
+                        // filter only our account
+                        if account_ref.eq(account_rcv) {
+                            if let Some(parsed) = mqtt_messages::parse_token_array(root_token, subtokens) {
+                                // Use the parsed HashMap here
+                                log::info!("parsed subtokens HashMap = {:?}", parsed);
+                                match *parsed.get("subToken").unwrap() {
+                                    // process hi level commands:
+                                    "commands" => {
+                                        // process device operations:
+                                        let device = *parsed.get("device").unwrap();
+                                        let channel = *parsed.get("channel").unwrap();
+                                        match channel.parse::<u8>() {
+                                            Ok(channel_u8) => {
+                                                match *parsed.get("action").unwrap() {
+                                                    "in" => {
+                                                        // process set new device value
+                                                        match float_str.parse::<f32>() {
+                                                            Ok(val) => {
+                                                                log::info!("Parsed float: {}", val);
+                                                                let _ = push_command(
+                                                                    &commands_array_ref.clone(),
+                                                                    SsnDeviceCommand {
+                                                                        dev_id: device.to_string(),
+                                                                        channel: channel_u8,
+                                                                        value: val,
+                                                                    },
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                log::info!("Error parsing float: {}", e)
+                                                            }
+                                                        }
+                                                    },
+                                                    "reset" => {
+                                                        // TO DO
+                                                    }, 
+                                                    &_ => {}
+            
+                                                }
+                                            }
+                                        Err(_) => todo!(),
+                                        }
+                                    },
+                                    &_ => {}
+
+                                }
+                                         } else {
+                                log::warn!("Failed to parse tokens for topic: {}", topic);
+                            }
+                        }
+    
                 }
+                }
+                
 
                 if let Some(vals) = get_sensor_values(&shared_data.clone(), "aht21-test") {
                     log::info!("sensor val: {:?}", vals);
@@ -888,7 +800,7 @@ fn main_logic() -> Result<()> {
         // );
         status_led(&mut ws2812, Colors::Blue);
 
-        // FreeRtos::delay_ms(2000);
+        FreeRtos::delay_ms(100);
         let (command_dev_id, command_channel, command_value) =
             if let Some(command) = pop_command(&commands_array) {
                 log::info!(
@@ -1060,31 +972,47 @@ fn main_logic() -> Result<()> {
                         last_sent_value,
                         ..
                     } => {
-                        let mut new_value = *data;
-                        // check set value for StoreInt
+                        // check set value for StoreInt and store to Hash:
                         if dev.eq(&command_dev_id) {
                             log::info!("set value StoreInt {}", command_value);
-                            new_value = command_value as i32;
-                        }
-                        // Calculate percentage changes
-                        let change_pct = calculate_percentage_change(new_value as f32, *data as f32);
-                        *data = new_value;
+                            data.insert(command_channel.to_string(), command_value as i32);
+                        };
+                        // iterate for all values:
+                        data.iter_mut().for_each(|d| {
+                            let old_value = *d.1;
+                            let new_value = old_value;
 
-                        // Handle co2eq update
-                        let _ = handle_sensor_value_update(
-                            &mut client,
-                            *data,
-                            last_sent_value,
-                            last_update,
-                            change_pct,
-                            delta,
-                            delta_over.as_ref(),
-                            now,
-                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
-                            "storeInt",
-                        );
-                        let _ = update_sensor_data(&shared_data_ref, dev, vec![*data as f32]);
+
+                            // Calculate percentage changes
+                            let change_pct = calculate_percentage_change(new_value as f32,old_value as f32);
+
+                            // Handle update
+                            let mut cur_last_sent_value = 
+                                match last_sent_value.get(d.0) {
+                                    Some(v) => v.map(|x| x as f32),
+                                    None => None
+                            };
+                            let mut cur_last_update = 
+                                match last_update.get(d.0) {
+                                    Some(v) => *v,
+                                    None => Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                                                                    };
+
+                            let _ = handle_sensor_value_update(
+                                &mut client,
+                                old_value as f32,
+                                &mut cur_last_sent_value,
+                                &mut cur_last_update,
+                                change_pct,
+                                delta,
+                                delta_over.as_ref(),
+                                now,
+                                Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                                &mqtt_messages::publish_sensor_topic(&account, &object, &dev, d.0),
+                                "storeInt",
+                            );
+                            // let _ = update_sensor_data(&shared_data_ref, dev, vec![data]);
+                            });
 
                     }
                     SsnDevices::Ens160 {

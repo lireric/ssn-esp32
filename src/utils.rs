@@ -2,10 +2,12 @@ use embedded_svc::mqtt::client::Client;
 use embedded_svc::mqtt::client::{
     Details::Complete, EventPayload::Error, EventPayload::Received, QoS,
 };
+use esp_idf_hal::adc::ADC1;
+use esp_idf_hal::gpio::ADCPin;
 use std::fmt::{Debug, Display};
 use std::time::{Duration, Instant};
 
-use crate::{update_sensor_data, SharedSensorData};
+use crate::{update_sensor_data, SharedSensorData, SsnChannelInfo, SsnDevice, SsnDevices};
 
 // use crate::mqtt_messages;
 
@@ -70,4 +72,137 @@ where
         log::info!("Sensor {} skip sending  to mqtt", value_name);
     }
     Ok(())
+}
+
+impl<P: ADCPin<Adc = ADC1>> SsnDevice<P> {
+    pub fn get_channels(&self) -> Vec<SsnChannelInfo> {
+        match &self.device {
+            SsnDevices::Bmp180 { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "temperature",
+                    description: "Temperature in °C",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "pressure",
+                    description: "Pressure in hPa",
+                },
+                SsnChannelInfo {
+                    index: 2,
+                    name: "altitude",
+                    description: "Altitude in meters",
+                },
+            ],
+            SsnDevices::Ens160 { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "co2",
+                    description: "CO2 equivalent in ppm",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "tvoc",
+                    description: "TVOC in ppb",
+                },
+                SsnChannelInfo {
+                    index: 2,
+                    name: "aqi",
+                    description: "Air Quality Index",
+                },
+            ],
+            SsnDevices::Adc { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "voltage",
+                    description: "Voltage in mV",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "raw",
+                    description: "Raw ADC value",
+                },
+            ],
+            SsnDevices::Aht21 { .. } => vec![
+                SsnChannelInfo {
+                    index: 0,
+                    name: "temperature",
+                    description: "Temperature in °C",
+                },
+                SsnChannelInfo {
+                    index: 1,
+                    name: "humidity",
+                    description: "Humidity in %",
+                },
+            ],
+            SsnDevices::StoreInt { .. } => vec![SsnChannelInfo {
+                index: 0,
+                name: "value",
+                description: "Stored integer value",
+            }],
+        }
+    }
+    // Return real channel by it name or 0
+    pub fn get_channel_by_name(&self, name: &str) -> usize {
+        self.get_channels()
+            .into_iter()
+            .find(|c| c.name == name)
+            .map(|c| c.index)
+            .unwrap_or(0)
+    }
+
+    pub fn get_value_by_channel(&self, channel: usize) -> Option<f32> {
+        let channel = self
+            .get_channels()
+            .into_iter()
+            .find(|c| c.index == channel)?
+            .name;
+
+        match &self.device {
+            SsnDevices::Bmp180 {
+                temperature,
+                pressure,
+                altitude,
+                ..
+            } => match channel {
+                "temperature" => Some(*temperature),
+                "pressure" => Some(*pressure as f32),
+                "altitude" => Some(*altitude),
+                _ => None,
+            },
+            SsnDevices::Ens160 {
+                co2eq_ppm,
+                tvoc_ppb,
+                aqi,
+                ..
+            } => match channel {
+                "co2" => Some(*co2eq_ppm as f32),
+                "tvoc" => Some(*tvoc_ppb as f32),
+                "aqi" => Some(*aqi as f32),
+                _ => None,
+            },
+            SsnDevices::Adc {
+                voltage_mv,
+                raw_value,
+                ..
+            } => match channel {
+                "voltage" => Some(*voltage_mv),
+                "raw" => Some(*raw_value as f32),
+                _ => None,
+            },
+            SsnDevices::Aht21 {
+                temperature,
+                humidity,
+                ..
+            } => match channel {
+                "temperature" => Some(*temperature),
+                "humidity" => Some(*humidity),
+                _ => None,
+            },
+            SsnDevices::StoreInt { data, .. } => match channel {
+                "value" => Some(0.0), // Some(data.get(channel)), TO DO work with hash...
+                _ => None,
+            },
+        }
+    }
 }
