@@ -18,6 +18,21 @@ pub struct AdcReader<P: ADCPin<Adc = ADC1>> {
     adc_pin: AdcChannelDriver<'static, P, AdcDriver<'static, ADC1>>,
 }
 
+// Define the trait for ADC functionality
+pub trait AdcReaderTrait {
+    fn read(&mut self) -> Result<(u16, f32)>; // Example method signature
+                                              // Add other required methods here
+}
+
+impl<P: ADCPin<Adc = ADC1>> AdcReaderTrait for AdcReader<P> {
+    // Implement all required trait methods here
+    fn read(&mut self) -> anyhow::Result<(u16, f32)> {
+        let raw_value = self.adc_pin.read()?;
+        let voltage_mv = (raw_value as f32 * 2500.0) / 4095.0; // Approximate conversion
+        Ok((raw_value, voltage_mv))
+    }
+}
+
 impl<P: ADCPin<Adc = ADC1>> AdcReader<P> {
     pub fn new(gpio_pin: P, adc1: impl Peripheral<P = ADC1> + 'static) -> anyhow::Result<Self> {
         // let pins = peripherals.pins;
