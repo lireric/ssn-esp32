@@ -3,9 +3,13 @@ use adc_reader::AdcReaderTrait;
 use anyhow::{Context, Result};
 use esp_idf_hal::gpio::AnyInputPin;
 use esp_idf_hal::gpio::AnyOutputPin;
+use esp_idf_hal::gpio::Input;
+use esp_idf_hal::gpio::InputOutput;
 use esp_idf_hal::gpio::InterruptType;
+use esp_idf_hal::gpio::Level;
 use esp_idf_hal::gpio::Pin;
 use esp_idf_hal::gpio::Pull;
+use esp_idf_sys::EspError;
 use core::str;
 use embedded_hal::i2c::ErrorType;
 use embedded_hal::i2c::I2c;
@@ -221,7 +225,7 @@ enum SsnDevices<'a> {
         delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
         last_update: Instant,
         last_sent_value: Option<bool>,
-        sensor: AnyInputPin,
+        sensor: Box<dyn PinDriverTrait + 'a>,
     },
     GpioOutput {
         data: bool,
@@ -234,16 +238,38 @@ enum SsnDevices<'a> {
 }
 
 pub trait PinDriverTrait {
+    fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError>;
     // Define required pin driver methods here
     fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError>;
     fn set_low(&mut self) -> Result<(), esp_idf_sys::EspError>;
 }
-impl<'d, T: Pin> PinDriverTrait for PinDriver<'d, T, Output> {
+impl<'d, T: Pin> PinDriverTrait for PinDriver<'d, T, InputOutput> {
     fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError> {
         PinDriver::set_high(self)
     }
     fn set_low(&mut self) -> Result<(), esp_idf_sys::EspError> {
         PinDriver::set_low(self)
+    }
+    
+    fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError> {
+        Ok(PinDriver::get_level(self) == Level::High)
+    }
+    // fn get_value(&mut self) -> Result<(bool), esp_idf_sys::EspError> {
+    //     if PinDriver::get_level(&self) == Level::High { Ok(true) }
+    //     else {Ok(false)}
+    // }
+}
+impl<'d, T: Pin> PinDriverTrait for PinDriver<'d, T, Input> {
+    fn get_value(&mut self) -> Result<bool, EspError> {
+        Ok(PinDriver::get_level(self) == Level::High)
+    }
+    // Input pins can't set levels, so provide empty implementations
+    fn set_high(&mut self) -> Result<(), EspError> {
+        Err(EspError::from(esp_idf_sys::ESP_ERR_NOT_SUPPORTED).unwrap())
+    }
+
+    fn set_low(&mut self) -> Result<(), EspError> {
+        Err(EspError::from(esp_idf_sys::ESP_ERR_NOT_SUPPORTED).unwrap())
     }
 }
 
@@ -515,7 +541,24 @@ fn main_logic() -> Result<()> {
                  delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
                  last_sent_value: None, 
                 //  sensor: peripherals.pins.gpio5.into(),
-                 sensor: Box::new(PinDriver::output(peripherals.pins.gpio5)?),
+                 sensor: Box::new(PinDriver::input_output(peripherals.pins.gpio5)?),
+                },
+        },
+    );
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "gpio-in6".to_string(),
+            period: SsnSensorPeriod::Fast,
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::GpioInput { data: false,
+                 delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
+                 last_sent_value: None, 
+                //  sensor: peripherals.pins.gpio5.into(),
+                 sensor: Box::new(PinDriver::input(peripherals.pins.gpio6)?),
+                interrupt_type: InterruptType::PosEdge,
+                pull_type: Pull::Up,
                 },
         },
     );
@@ -1250,7 +1293,25 @@ fn main_logic() -> Result<()> {
                             *data = (command_value != 0.0);
                             // sensor.into()
                         };
-                    },
+                        let new_data = sensor.get_value().unwrap();
+                        let data_change_pct = calculate_percentage_change(new_data as u8 as f32, *data as u8 as f32);
+
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            new_data,
+                            last_sent_value,
+                            last_update,
+                            data_change_pct,
+                            delta,
+                            delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "0"),
+                            "gpio-in",
+                        );
+                        *data = new_data;
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![new_data as u8 as f32]);
+    },
                     SsnDevices::GpioOutput { 
                         data, 
                         delta, 
