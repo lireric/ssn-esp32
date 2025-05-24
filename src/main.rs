@@ -5,8 +5,10 @@ use esp_idf_hal::gpio::AnyInputPin;
 use esp_idf_hal::gpio::AnyOutputPin;
 use esp_idf_hal::gpio::Input;
 use esp_idf_hal::gpio::InputOutput;
+use esp_idf_hal::gpio::InputPin;
 use esp_idf_hal::gpio::InterruptType;
 use esp_idf_hal::gpio::Level;
+use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::gpio::Pin;
 use esp_idf_hal::gpio::Pull;
 use esp_idf_sys::EspError;
@@ -218,13 +220,13 @@ enum SsnDevices<'a> {
         last_sent_value: HashMap<String, Option<i32>>,
     },
     GpioInput {
-        data: bool,
+        data: u8,
         delta: f32,
         interrupt_type: InterruptType,
         pull_type: Pull,
         delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
         last_update: Instant,
-        last_sent_value: Option<bool>,
+        last_sent_value: Option<u8>,
         sensor: Box<dyn PinDriverTrait + 'a>,
     },
     GpioOutput {
@@ -238,28 +240,28 @@ enum SsnDevices<'a> {
 }
 
 pub trait PinDriverTrait {
+    fn set_pull(&mut self, pull: Pull)-> Result<(), esp_idf_sys::EspError>;
     fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError>;
     // Define required pin driver methods here
     fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError>;
     fn set_low(&mut self) -> Result<(), esp_idf_sys::EspError>;
 }
-impl<'d, T: Pin> PinDriverTrait for PinDriver<'d, T, InputOutput> {
+impl<'d, T: Pin + InputPin + OutputPin> PinDriverTrait for PinDriver<'d, T, InputOutput> {
     fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError> {
         PinDriver::set_high(self)
     }
     fn set_low(&mut self) -> Result<(), esp_idf_sys::EspError> {
         PinDriver::set_low(self)
     }
+    fn set_pull(&mut self, pull: Pull) -> Result<(), esp_idf_sys::EspError>{
+        PinDriver::set_pull(self, pull)
+    }
     
     fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError> {
         Ok(PinDriver::get_level(self) == Level::High)
     }
-    // fn get_value(&mut self) -> Result<(bool), esp_idf_sys::EspError> {
-    //     if PinDriver::get_level(&self) == Level::High { Ok(true) }
-    //     else {Ok(false)}
-    // }
 }
-impl<'d, T: Pin> PinDriverTrait for PinDriver<'d, T, Input> {
+impl<'d, T: Pin + InputPin + OutputPin> PinDriverTrait for PinDriver<'d, T, Input> {
     fn get_value(&mut self) -> Result<bool, EspError> {
         Ok(PinDriver::get_level(self) == Level::High)
     }
@@ -270,6 +272,9 @@ impl<'d, T: Pin> PinDriverTrait for PinDriver<'d, T, Input> {
 
     fn set_low(&mut self) -> Result<(), EspError> {
         Err(EspError::from(esp_idf_sys::ESP_ERR_NOT_SUPPORTED).unwrap())
+    }
+    fn set_pull(&mut self, pull: Pull) -> Result<(), esp_idf_sys::EspError>{
+        PinDriver::set_pull(self, pull)
     }
 }
 
@@ -302,6 +307,19 @@ impl<'a> SsnDevice<'a> {
             .find(|d| d.lock().unwrap().dev_id == dev_id)
             .map(Arc::clone)
     }
+    // func is called at device creating:
+    pub fn dev_init(&mut self) {
+        log::info!("device {} preinit", self.dev_id);
+        match &mut self.device {
+            SsnDevices::GpioInput { data, delta, interrupt_type, pull_type, delta_over, last_update, last_sent_value, sensor } => {
+                let _ = sensor.set_pull(*pull_type);
+            },
+            SsnDevices::GpioOutput { data, delta, delta_over, last_update, last_sent_value, sensor } => {
+                // let _ = sensor.set_pull(*pull_type);
+            },
+            _ => (),
+        }
+    }
 }
 
 // #[derive(Default)]
@@ -324,7 +342,8 @@ fn create_shared_devices(
 }
 
 impl <'a>SsnDevice <'a>{
-    pub fn add_shared_device(devices: &mut Vec<SharedSsnDevice<'a>>, new_device: SsnDevice<'a>) {
+    pub fn add_shared_device(devices: &mut Vec<SharedSsnDevice<'a>>, mut new_device: SsnDevice<'a>) {
+        new_device.dev_init(); // preinit device if needed
         devices.push(Arc::new(Mutex::new(new_device)));
     }
 }
@@ -552,14 +571,15 @@ fn main_logic() -> Result<()> {
             period: SsnSensorPeriod::Fast,
             is_active: true,
             is_paused: false,
-            device: SsnDevices::GpioInput { data: false,
+            device: SsnDevices::GpioInput { data: 0,
                  delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
                  last_sent_value: None, 
-                //  sensor: peripherals.pins.gpio5.into(),
+                 interrupt_type: InterruptType::PosEdge,
+                 pull_type: Pull::Floating,
+                 //  sensor: peripherals.pins.gpio5.into(),
                  sensor: Box::new(PinDriver::input(peripherals.pins.gpio6)?),
-                interrupt_type: InterruptType::PosEdge,
-                pull_type: Pull::Up,
                 },
+                
         },
     );
 
@@ -1290,11 +1310,11 @@ fn main_logic() -> Result<()> {
                     } => {
                         if dev.eq(&command_dev_id) {
                             log::info!("set value StoreInt {}", command_value);
-                            *data = (command_value != 0.0);
+                            *data = command_value as u8;
                             // sensor.into()
                         };
-                        let new_data = sensor.get_value().unwrap();
-                        let data_change_pct = calculate_percentage_change(new_data as u8 as f32, *data as u8 as f32);
+                        let new_data = sensor.get_value().unwrap() as u8;
+                        let data_change_pct = calculate_percentage_change(new_data as f32, *data as u8 as f32);
 
                         let _ = handle_sensor_value_update(
                             &mut client,
@@ -1310,7 +1330,7 @@ fn main_logic() -> Result<()> {
                             "gpio-in",
                         );
                         *data = new_data;
-                        let _ = update_sensor_data(&shared_data_ref, dev, vec![new_data as u8 as f32]);
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![new_data as f32]);
     },
                     SsnDevices::GpioOutput { 
                         data, 
