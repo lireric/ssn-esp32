@@ -11,11 +11,15 @@ use esp_idf_hal::gpio::Level;
 use esp_idf_hal::gpio::OutputPin;
 use esp_idf_hal::gpio::Pin;
 use esp_idf_hal::gpio::Pull;
+use esp_idf_hal::task::notification::Notification;
 use esp_idf_sys::EspError;
 use core::str;
+use std::any::Any;
+use std::num::NonZero;
 use embedded_hal::i2c::ErrorType;
 use embedded_hal::i2c::I2c;
 use esp_idf_hal::peripherals;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use esp_idf_svc::mqtt::client::EspMqttEvent;
 use esp_idf_svc::mqtt::client::EventPayload;
@@ -96,6 +100,8 @@ const RECONNECT_DELAY_MS: u64 = 5000;
 const MAIN_LOOP_DELAY_MS: u64 = 100;
 const MIDDLE_LOOP_PERIOD_MS: u64 = 20000;
 const SLOW_LOOP_PERIOD_MS: u64 = 60000;
+
+static INTERRUPT_COUNTER_GPIO: AtomicU32 = AtomicU32::new(0);
 
 lazy_static! {
     // static ref I2C: Mutex<Option<I2cDriver<'static>>> = Mutex::new(None);
@@ -223,11 +229,14 @@ enum SsnDevices<'a> {
         data: u8,
         delta: f32,
         interrupt_type: InterruptType,
+        notificator: Arc<Notification>,
+        counter: u64,
         pull_type: Pull,
         delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
         last_update: Instant,
         last_sent_value: Option<u8>,
-        sensor: Box<dyn PinDriverTrait + 'a>,
+        last_sent_counter: Option<u64>,
+        sensor: Box<dyn PinDriverBasicInput + 'static>,
     },
     GpioOutput {
         data: bool,
@@ -235,18 +244,101 @@ enum SsnDevices<'a> {
         delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
         last_update: Instant,
         last_sent_value: Option<bool>,
-        sensor:  Box<dyn PinDriverTrait + 'a>,
+        sensor:  Box<dyn PinDriverTraitOutput + 'a>,
     },
 }
 
-pub trait PinDriverTrait {
+pub trait PinDriverBasicInput: Any {
     fn set_pull(&mut self, pull: Pull)-> Result<(), esp_idf_sys::EspError>;
     fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError>;
-    // Define required pin driver methods here
+    fn set_interrupt_type(&mut self, interript_type: InterruptType) -> Result<(), esp_idf_sys::EspError>;
+    // fn subscribe_boxed(&mut self, callback: Box<dyn FnMut() + Send + 'static>) -> Result<(), EspError>;
+    fn subscribe_boxed(&mut self, nf: Arc<Notification>) -> Result<(), EspError>;
+    fn enable_interrupt(&mut self) -> Result<(), esp_idf_sys::EspError>;
+    fn get_pin(&mut self) -> Result<i32, esp_idf_sys::EspError>;
+}
+
+impl dyn PinDriverBasicInput {
+    pub fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+// pub trait PinDriverInterrupt: PinDriverBasicInput {
+//     // fn subscribe<F>(&mut self, callback: F) -> Result<(), esp_idf_sys::EspError> where
+//     //     F: FnMut() + 'static  + Send;
+//         fn subscribe_boxed(&mut self, callback: Box<dyn FnMut() + Send + 'static>) -> Result<(), EspError>;
+//     }
+
+impl<T: Pin + InputPin + OutputPin> PinDriverBasicInput for PinDriver<'static, T, Input> {
+    fn get_pin(&mut self) -> Result<i32, esp_idf_sys::EspError> {
+        Ok(PinDriver::pin(self))
+    }
+    fn get_value(&mut self) -> Result<bool, EspError> {
+        Ok(PinDriver::get_level(self) == Level::High)
+    }
+    fn set_pull(&mut self, pull: Pull) -> Result<(), esp_idf_sys::EspError>{
+        PinDriver::set_pull(self, pull)
+    }
+    fn set_interrupt_type(&mut self, interript_type: InterruptType) -> Result<(), esp_idf_sys::EspError> {
+        PinDriver::set_interrupt_type(self, interript_type)
+    }
+    // fn subscribe_boxed(&mut self, callback: Box<dyn FnMut() + Send + 'static>) -> Result<(), EspError> {
+    //     log::info!("GpioInput subscribe callback");
+    //     unsafe { PinDriver::subscribe(self, callback) }
+    // }
+    fn subscribe_boxed(&mut self, nf: Arc<Notification>) -> Result<(), EspError> {
+        // unsafe { PinDriver::subscribe(self,move || interrupt_handler_gpio_t()) }
+        let notifier = nf.notifier().clone();
+        let pin_number = self.pin() as u32;
+        log::info!("GpioInput subscribe callback for pin {}", pin_number);
+        unsafe { PinDriver::subscribe(self,move || 
+            {
+                // Increment the counter atomically
+                INTERRUPT_COUNTER_GPIO.fetch_add(1, Ordering::SeqCst);
+                
+                // Notify the main task
+                notifier.notify_and_yield(std::num::NonZeroU32::new(pin_number).unwrap());
+            }) }
+    }
+    fn enable_interrupt(&mut self) -> Result<(), esp_idf_sys::EspError> {
+        PinDriver::enable_interrupt(self)
+    }
+}
+// impl<T: Pin + InputPin + OutputPin> PinDriverInterrupt for PinDriver<'static, T, Input> {
+//     fn subscribe_boxed(&mut self, callback: Box<dyn FnMut() + Send + 'static>) -> Result<(), EspError> {
+//         unsafe { PinDriver::subscribe(self, callback) }
+//     }
+//     // fn subscribe<F>(&mut self, callback: F) -> Result<(), esp_idf_sys::EspError>     
+//     // where
+//     // F: FnMut() + 'static  + Send {
+//     //     unsafe { PinDriver::subscribe_nonstatic(self, callback) }
+//     // }
+// }
+
+// impl<'d> SsnDevices<'d> {
+//     fn enable_interrupt(&mut self, int_type: InterruptType, callback: impl FnMut() + 'static + Send) -> anyhow::Result<()> {
+//         match self {
+//             SsnDevices::GpioInput { sensor, .. } => {
+//                 if let Some(base) = sensor.as_any().downcast_mut::<dyn PinDriverBasicInput>() {
+//                     base.set_interrupt_type(int_type)?;
+//                     if let Some(ext) = sensor.as_any().downcast_mut::<dyn PinDriverInterrupt>() {
+//                         ext.subscribe(Box::new(callback))?;
+//                     }
+//                 }
+//                 Ok(())
+//             }
+//             _ => Err(anyhow!("Device doesn't support interrupts")),
+//         }
+//     }
+// }
+
+pub trait PinDriverTraitOutput {
+    fn set_pull(&mut self, pull: Pull)-> Result<(), esp_idf_sys::EspError>;
+    fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError>;
     fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError>;
     fn set_low(&mut self) -> Result<(), esp_idf_sys::EspError>;
 }
-impl<'d, T: Pin + InputPin + OutputPin> PinDriverTrait for PinDriver<'d, T, InputOutput> {
+impl<'d, T: Pin + InputPin + OutputPin> PinDriverTraitOutput for PinDriver<'d, T, InputOutput> {
     fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError> {
         PinDriver::set_high(self)
     }
@@ -259,22 +351,6 @@ impl<'d, T: Pin + InputPin + OutputPin> PinDriverTrait for PinDriver<'d, T, Inpu
     
     fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError> {
         Ok(PinDriver::get_level(self) == Level::High)
-    }
-}
-impl<'d, T: Pin + InputPin + OutputPin> PinDriverTrait for PinDriver<'d, T, Input> {
-    fn get_value(&mut self) -> Result<bool, EspError> {
-        Ok(PinDriver::get_level(self) == Level::High)
-    }
-    // Input pins can't set levels, so provide empty implementations
-    fn set_high(&mut self) -> Result<(), EspError> {
-        Err(EspError::from(esp_idf_sys::ESP_ERR_NOT_SUPPORTED).unwrap())
-    }
-
-    fn set_low(&mut self) -> Result<(), EspError> {
-        Err(EspError::from(esp_idf_sys::ESP_ERR_NOT_SUPPORTED).unwrap())
-    }
-    fn set_pull(&mut self, pull: Pull) -> Result<(), esp_idf_sys::EspError>{
-        PinDriver::set_pull(self, pull)
     }
 }
 
@@ -311,8 +387,20 @@ impl<'a> SsnDevice<'a> {
     pub fn dev_init(&mut self) {
         log::info!("device {} preinit", self.dev_id);
         match &mut self.device {
-            SsnDevices::GpioInput { data, delta, interrupt_type, pull_type, delta_over, last_update, last_sent_value, sensor } => {
+            SsnDevices::GpioInput { data, delta, interrupt_type, pull_type, delta_over, last_update, last_sent_value, sensor, notificator, counter, last_sent_counter } => {
+                log::info!("GpioInput preinit set_pull={:?}, interrupt_type={:?}", *pull_type, *interrupt_type);
                 let _ = sensor.set_pull(*pull_type);
+                let _ = sensor.set_interrupt_type(*interrupt_type);
+
+                log::info!("GpioInput subscribe callback and enable interrupt");
+                // let _ = sensor.subscribe_boxed(Box::new(|| interrupt_handler_gpio_t()));
+                let _ = sensor.subscribe_boxed(notificator.clone());
+                let _ = sensor.enable_interrupt();
+
+                // if let Some(base) = sensor.as_any().downcast_mut::<Box<dyn PinDriverInterrupt>>() {
+                //     log::info!("GpioInput subscribe int callback");
+                //     let _ = base.subscribe_boxed(Box::new(|| interrupt_handler_gpio_t()));
+                // }
             },
             SsnDevices::GpioOutput { data, delta, delta_over, last_update, last_sent_value, sensor } => {
                 // let _ = sensor.set_pull(*pull_type);
@@ -420,6 +508,10 @@ fn main_logic() -> Result<()> {
 
     let commands_array = create_commands_array();
     let commands_array_ref = commands_array.clone();
+
+    // Create a notification handle for the interrupt
+    let notification = Arc::new(Notification::new());
+    let notification_clone = notification.clone();
 
     // Initialize NVS
     let nvs_default_partition: EspNvsPartition<NvsDefault> =
@@ -574,15 +666,36 @@ fn main_logic() -> Result<()> {
             device: SsnDevices::GpioInput { data: 0,
                  delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
                  last_sent_value: None, 
-                 interrupt_type: InterruptType::PosEdge,
-                 pull_type: Pull::Floating,
-                 //  sensor: peripherals.pins.gpio5.into(),
+                 interrupt_type: InterruptType::AnyEdge,
+                 pull_type: Pull::Up,
                  sensor: Box::new(PinDriver::input(peripherals.pins.gpio6)?),
+                notificator: notification_clone.clone(),
+                counter: 0,
+                last_sent_counter: None,
                 },
                 
         },
     );
-
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "gpio-in7".to_string(),
+            period: SsnSensorPeriod::Fast,
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::GpioInput { data: 0,
+                 delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
+                 last_sent_value: None, 
+                 interrupt_type: InterruptType::AnyEdge,
+                 pull_type: Pull::Up,
+                 sensor: Box::new(PinDriver::input(peripherals.pins.gpio7)?),
+                notificator: notification_clone.clone(),
+                counter: 0,
+                last_sent_counter: None,
+                },
+                
+        },
+    );
     SsnDevice::add_shared_device(
         &mut shared_devices,
         SsnDevice {
@@ -893,6 +1006,7 @@ fn main_logic() -> Result<()> {
 
     // ********************* main loop ****************************
     loop {
+
         // Check WiFi connection status
         if !ssn_wifi::check_wifi_connection(my_wifi.wifi()) {
             log::warn!("WiFi connection lost. Attempting to reconnect...");
@@ -911,6 +1025,7 @@ fn main_logic() -> Result<()> {
 
         log::info!("New measurment circle ..");
         let now = Instant::now();
+        
         // log::info!(
         //     "now = {:?},
         //     \ntime_counter_middle = {:?} \ntime_counter_seldom = {:?}",
@@ -933,6 +1048,13 @@ fn main_logic() -> Result<()> {
             } else {
                 ("".to_string(), 0, 0.0)
             };
+
+            let pin_num = if let Some(value) = notification.wait(0) {
+                // Get interrupted pin number:
+                let count = INTERRUPT_COUNTER_GPIO.load(Ordering::SeqCst);
+                println!("Interrupt triggered! pin = {} Total count: {}", value, count);
+                Some(u32::from(value))
+            } else {None};
 
         // log::info!(
         //     "pop_command: command_dev_id={}, command_channel={}, command_value={}",
@@ -1110,7 +1232,7 @@ fn main_logic() -> Result<()> {
                                             // Handle update
                                             let mut cur_last_sent_value = 
                                                 match last_sent_value.get(d.0) {
-                                                    Some(v) => v.map(|x| x as f32),
+                                                Some(v) => v.map(|x| x as f32),
                                                     None => None
                                             };
                                             let mut cur_last_update = 
@@ -1298,7 +1420,7 @@ fn main_logic() -> Result<()> {
                                         );
                                         let _ = update_sensor_data(&shared_data_ref, dev, vec![*temperature, *humidity]);
                                     },
-                    SsnDevices::GpioInput { 
+                    SsnDevices::GpioInput {
                         data, 
                         delta, 
                         delta_over, 
@@ -1306,15 +1428,27 @@ fn main_logic() -> Result<()> {
                         last_sent_value, 
                         sensor, 
                         interrupt_type, 
-                        pull_type 
-                    } => {
+                        pull_type,
+                        notificator,
+                        counter,
+                        last_sent_counter, 
+                        } => {
                         if dev.eq(&command_dev_id) {
-                            log::info!("set value StoreInt {}", command_value);
+                            log::info!("set value {}", command_value);
                             *data = command_value as u8;
                             // sensor.into()
                         };
+                        let current_pin = sensor.get_pin().unwrap() as u32;
+                        let old_counter = *counter;
+
+                        if pin_num == Some(current_pin) {
+                            *counter +=1;
+                            println!("Interrupt pin = {:?} current_pin: {}", pin_num, current_pin);
+                            let _ = sensor.enable_interrupt();
+                        };
                         let new_data = sensor.get_value().unwrap() as u8;
                         let data_change_pct = calculate_percentage_change(new_data as f32, *data as u8 as f32);
+                        let counter_change_pct = calculate_percentage_change(*counter as f32, old_counter as f32);
 
                         let _ = handle_sensor_value_update(
                             &mut client,
@@ -1330,8 +1464,21 @@ fn main_logic() -> Result<()> {
                             "gpio-in",
                         );
                         *data = new_data;
-                        let _ = update_sensor_data(&shared_data_ref, dev, vec![new_data as f32]);
-    },
+                        let _ = handle_sensor_value_update(
+                            &mut client,
+                            *counter  as f64,
+                            &mut last_sent_counter.map(|v| v as f64),
+                            last_update,
+                            counter_change_pct,
+                            delta,
+                            delta_over.as_ref(),
+                            now,
+                            Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
+                            &mqtt_messages::publish_sensor_topic(&account, &object, &dev, "1"),
+                            "gpio-in-counter",
+                        );
+                        let _ = update_sensor_data(&shared_data_ref, dev, vec![new_data as f32, *counter as f32]);
+                    },
                     SsnDevices::GpioOutput { 
                         data, 
                         delta, 
@@ -1423,3 +1570,13 @@ fn main() -> Result<()> {
     })
     // Ok(())
 }
+
+// // Shared interrupt handler
+// fn interrupt_handler_gpio(pin_num: u8) {
+//     INTERRUPT_GPIO_MASK.fetch_or(1 << pin_num, Ordering::SeqCst);
+// }
+
+// extern "C" fn interrupt_handler_gpio_t() {
+//     println!("interrupt_handler_gpio_t !!!");
+//     INTERRUPT_GPIO_MASK.fetch_or(1 << 3, Ordering::SeqCst);
+// }
