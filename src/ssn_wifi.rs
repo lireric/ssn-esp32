@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::peripheral,
+    sntp::{EspSntp, SyncMode},
     wifi::{
         AccessPointConfiguration, AuthMethod, BlockingWifi, ClientConfiguration, Configuration,
         EspWifi,
@@ -185,6 +186,5 @@ pub fn wifi<'a>(
         // delay here before retrying
         std::thread::sleep(Duration::from_secs(10));
     }
-
     Ok(wifi)
 }

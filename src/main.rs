@@ -1,6 +1,9 @@
 use adc_reader::AdcReaderTrait;
 // #![cfg(feature = "smart-leds-trait")]
 use anyhow::{Context, Result};
+use chrono::DateTime;
+use chrono::FixedOffset;
+use chrono::Utc;
 use esp_idf_hal::gpio::AnyInputPin;
 use esp_idf_hal::gpio::AnyOutputPin;
 use esp_idf_hal::gpio::Input;
@@ -20,9 +23,12 @@ use embedded_hal::i2c::ErrorType;
 use embedded_hal::i2c::I2c;
 use esp_idf_hal::peripherals;
 use std::sync::atomic::{AtomicU32, Ordering};
+use chrono::{Local, Timelike, TimeZone, Datelike};
 
 use esp_idf_svc::mqtt::client::EspMqttEvent;
 use esp_idf_svc::mqtt::client::EventPayload;
+use esp_idf_svc::sntp::{EspSntp, SyncMode};
+
 use log::error;
 use std::borrow::Borrow;
 use std::cell::RefCell;
@@ -93,6 +99,7 @@ use aht21::AHT21Sensor;
 
 mod utils;
 
+// ----------------------------------
 // if sensor value is not changed in this period mqtt message will by sended anyway
 const MAX_PERIOD_REFRESH_MQTT: u64 = 60; // sec.
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
@@ -100,14 +107,98 @@ const RECONNECT_DELAY_MS: u64 = 5000;
 const MAIN_LOOP_DELAY_MS: u64 = 100;
 const MIDDLE_LOOP_PERIOD_MS: u64 = 20000;
 const SLOW_LOOP_PERIOD_MS: u64 = 60000;
+static DEF_TZ: i32 = 3; // default timezone (may by overrided from settings)
 
+// ----------------------------------
 static INTERRUPT_COUNTER_GPIO: AtomicU32 = AtomicU32::new(0);
+
+// struct SharedPinDriver<T: Pin>(Arc<Mutex< PinDriver<'static, T, Input>>>);
+lazy_static! {
+    static ref INTERRUPT_GPIO_HASHMAP: Mutex<[AtomicU32; 10]> = Mutex::new([
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+]);
+}
 
 lazy_static! {
     // static ref I2C: Mutex<Option<I2cDriver<'static>>> = Mutex::new(None);
     static ref I2C: Mutex<Option<Arc<Mutex<I2cDriver<'static>>>>> = Mutex::new(None);
 }
 
+// ----------------------------------
+// Alarm structure
+#[derive(Clone)]
+struct Alarm {
+    trigger_time: DateTime<Utc>,
+    active_duration_secs: u32,
+    dev_id: String,
+    active_level: u8,
+    inactive_level: u8,
+    previously_active: bool,
+}
+
+// Shared alarm storage
+lazy_static! {
+    static ref ALARMS: Mutex<Vec<Alarm>> = Mutex::new(Vec::new());
+}
+
+// Add new alarm
+fn add_alarm(trigger_time: DateTime<FixedOffset>, duration_secs: u32, dev_id: String, active_level: u8, inactive_level: u8) {
+    let trigger_time_utc = trigger_time.with_timezone(&Utc);
+    ALARMS.lock().unwrap().push(Alarm {
+        trigger_time: trigger_time_utc,
+        active_duration_secs: duration_secs,
+        dev_id,
+        active_level,
+        previously_active: false,
+        inactive_level,
+    });
+    log::info!("added alarm: {:?} [at UTC={:?}], duration = {}", trigger_time, trigger_time_utc, duration_secs);
+}
+
+fn check_alarms() -> Vec<(String, u8)> {
+    let now = Utc::now();
+    let current_time = now.time();
+    // let offset = FixedOffset::east_opt(DEF_TZ * 3600).unwrap(); // Seconds
+    // let now = Local::now().with_timezone(&offset);
+ 
+    let mut alarms = ALARMS.lock().unwrap();
+    let mut actions: Vec<(String, u8)> = Vec::new();
+
+    for alarm in alarms.iter_mut() {
+        // TO DO: work with absolute dates or hourly/minutly etc variants
+        let alarm_time = alarm.trigger_time.time();
+        let end_time = alarm_time + chrono::Duration::seconds(alarm.active_duration_secs as i64);
+        let is_active = if alarm_time <= end_time {
+            current_time >= alarm_time && current_time <= end_time
+        } else {
+            // Handle midnight wrap-around
+            current_time >= alarm_time || current_time <= end_time
+        };
+
+        // let is_active = now >= alarm.trigger_time && 
+        //                 now <= alarm.trigger_time + chrono::Duration::seconds(alarm.active_duration_secs as i64);
+        
+        // Only return actions when state changes
+        if is_active != alarm.previously_active {
+            let level = if is_active { alarm.active_level } else { alarm.inactive_level };
+            actions.push((alarm.dev_id.clone(), level));
+            alarm.previously_active = is_active;
+        }
+    }
+
+    actions
+}
+
+// ----------------------------------
 #[derive(Clone)]
 struct SharedI2c(Arc<Mutex<I2cDriver<'static>>>);
 impl SharedI2c {
@@ -230,12 +321,12 @@ enum SsnDevices<'a> {
         delta: f32,
         interrupt_type: InterruptType,
         notificator: Arc<Notification>,
-        counter: u64,
+        counter: u32,
         pull_type: Pull,
         delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
         last_update: Instant,
         last_sent_value: Option<u8>,
-        last_sent_counter: Option<u64>,
+        last_sent_counter: Option<u32>,
         sensor: Box<dyn PinDriverBasicInput + 'static>,
     },
     GpioOutput {
@@ -248,7 +339,7 @@ enum SsnDevices<'a> {
     },
 }
 
-pub trait PinDriverBasicInput: Any {
+pub trait PinDriverBasicInput: Any+Send {
     fn set_pull(&mut self, pull: Pull)-> Result<(), esp_idf_sys::EspError>;
     fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError>;
     fn set_interrupt_type(&mut self, interript_type: InterruptType) -> Result<(), esp_idf_sys::EspError>;
@@ -295,6 +386,7 @@ impl<T: Pin + InputPin + OutputPin> PinDriverBasicInput for PinDriver<'static, T
             {
                 // Increment the counter atomically
                 INTERRUPT_COUNTER_GPIO.fetch_add(1, Ordering::SeqCst);
+                INTERRUPT_GPIO_HASHMAP.lock().unwrap()[pin_number as usize].fetch_add(1, Ordering::SeqCst);
                 
                 // Notify the main task
                 notifier.notify_and_yield(std::num::NonZeroU32::new(pin_number).unwrap());
@@ -304,33 +396,6 @@ impl<T: Pin + InputPin + OutputPin> PinDriverBasicInput for PinDriver<'static, T
         PinDriver::enable_interrupt(self)
     }
 }
-// impl<T: Pin + InputPin + OutputPin> PinDriverInterrupt for PinDriver<'static, T, Input> {
-//     fn subscribe_boxed(&mut self, callback: Box<dyn FnMut() + Send + 'static>) -> Result<(), EspError> {
-//         unsafe { PinDriver::subscribe(self, callback) }
-//     }
-//     // fn subscribe<F>(&mut self, callback: F) -> Result<(), esp_idf_sys::EspError>     
-//     // where
-//     // F: FnMut() + 'static  + Send {
-//     //     unsafe { PinDriver::subscribe_nonstatic(self, callback) }
-//     // }
-// }
-
-// impl<'d> SsnDevices<'d> {
-//     fn enable_interrupt(&mut self, int_type: InterruptType, callback: impl FnMut() + 'static + Send) -> anyhow::Result<()> {
-//         match self {
-//             SsnDevices::GpioInput { sensor, .. } => {
-//                 if let Some(base) = sensor.as_any().downcast_mut::<dyn PinDriverBasicInput>() {
-//                     base.set_interrupt_type(int_type)?;
-//                     if let Some(ext) = sensor.as_any().downcast_mut::<dyn PinDriverInterrupt>() {
-//                         ext.subscribe(Box::new(callback))?;
-//                     }
-//                 }
-//                 Ok(())
-//             }
-//             _ => Err(anyhow!("Device doesn't support interrupts")),
-//         }
-//     }
-// }
 
 pub trait PinDriverTraitOutput {
     fn set_pull(&mut self, pull: Pull)-> Result<(), esp_idf_sys::EspError>;
@@ -608,6 +673,11 @@ fn main_logic() -> Result<()> {
             e
         )
     })?;
+    let _sntp = EspSntp::new_default()?; // Syncs time automatically
+    // TO DO: get TZ from settings
+    let offset = FixedOffset::east_opt(DEF_TZ * 3600).unwrap_or(FixedOffset::east(0)); // Seconds
+    let local_time = Local::now().with_timezone(&offset);
+    log::info!("Sinc time.. {:?}", local_time);
 
     // green LED after successful WiFi:
     status_led(&mut ws2812, Colors::Green);
@@ -788,6 +858,15 @@ fn main_logic() -> Result<()> {
                 delta_over: None,
             },
         },
+    );
+
+    // ---------------------------- Alarms:
+    add_alarm(
+        FixedOffset::east_opt(DEF_TZ * 3600).unwrap().with_ymd_and_hms(2025, 8, 2, 0, 25, 0).unwrap(),
+        20,
+        "gpio-out5".to_string(),
+        1,
+        0
     );
 
     // MQTT Client configuration *******************************************************
@@ -1023,9 +1102,29 @@ fn main_logic() -> Result<()> {
             }
         }
 
-        log::info!("New measurment circle ..");
+        let cur_time = Utc::now();
         let now = Instant::now();
+        log::info!("New measurment circle t={:?}..", cur_time);
         
+        // TO DO: Trigger at 14:30 every day .. change to flexible logic
+        // if cur_time.hour() == 14 && cur_time.minute() == 30 {
+        //     println!("Scheduled task triggered at {:?}", cur_time);
+        //     // Your task logic here
+        // }
+
+        // check for alarms and make command for device action:
+        // check_alarms returm actual dev_id and value only at the moment of timer triggered or canceled
+        check_alarms().iter().for_each(|alarm| {
+            log::info!("Alarm triggered dev_id={}, value={}", alarm.0, alarm.1);
+            let _ = push_command(
+                &commands_array.clone(),
+                SsnDeviceCommand {
+                    dev_id: alarm.0.clone(),
+                    channel: 0,
+                    value: alarm.1 as f32,
+                });
+        });
+
         // log::info!(
         //     "now = {:?},
         //     \ntime_counter_middle = {:?} \ntime_counter_seldom = {:?}",
@@ -1442,7 +1541,8 @@ fn main_logic() -> Result<()> {
                         let old_counter = *counter;
 
                         if pin_num == Some(current_pin) {
-                            *counter +=1;
+                            *counter += INTERRUPT_GPIO_HASHMAP.lock().unwrap()[current_pin as usize].load(Ordering::SeqCst);
+                            INTERRUPT_GPIO_HASHMAP.lock().unwrap()[current_pin as usize].store(0, Ordering::SeqCst); // reset counter again
                             println!("Interrupt pin = {:?} current_pin: {}", pin_num, current_pin);
                             let _ = sensor.enable_interrupt();
                         };
