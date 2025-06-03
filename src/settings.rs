@@ -9,12 +9,15 @@ use std::fmt;
 pub struct Config {
     pub account: String,
     pub object: String,
+    pub ssn_id: String,
     pub mqtt_host: String,
     pub mqtt_user: String,
     pub mqtt_pass: String,
     pub wifi_ssid: String,
     pub wifi_psk: String,
     pub mqtt_client_id: String,
+    pub ssn_wifi_ssid: String,
+    pub ssn_wifi_pass: String,
 }
 
 impl Default for Config {
@@ -28,6 +31,9 @@ impl Default for Config {
             wifi_ssid: "lir".to_string(),
             wifi_psk: "springrain".to_string(),
             mqtt_client_id: "esp_client_id_12345".to_string(),
+            ssn_id: "123".to_string(),
+            ssn_wifi_ssid: "ssn".to_string(),
+            ssn_wifi_pass: "ssn123456".to_string(),
         }
     }
 }

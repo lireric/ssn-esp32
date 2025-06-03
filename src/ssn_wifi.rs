@@ -98,6 +98,8 @@ pub fn wifi<'a>(
     pass: &'a str,
     modem: impl peripheral::Peripheral<P = esp_idf_svc::hal::modem::Modem> + 'static,
     sysloop: EspSystemEventLoop,
+    ssn_wifi_ssid: &'a str,
+    ssn_wifi_pass: &'a str,
 ) -> anyhow::Result<BlockingWifi<EspWifi<'static>>> {
     let mut auth_method = AuthMethod::WPA2Personal;
     // let mut auth_method = AuthMethod::WPA;
@@ -162,8 +164,8 @@ pub fn wifi<'a>(
             ..Default::default()
         },
         AccessPointConfiguration {
-            ssid: "ssn".try_into().expect("err"),
-            password: "ssn123456".try_into().expect("err"),
+            ssid: ssn_wifi_ssid.try_into().expect("err"), //"ssn".try_into().expect("err"),
+            password: ssn_wifi_pass.try_into().expect("err"), //"ssn123456".try_into().expect("err"),
             channel: channel.unwrap_or(1),
             ..Default::default()
         },
