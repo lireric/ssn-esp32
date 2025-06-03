@@ -1,39 +1,36 @@
-use anyhow::{Context, Result};
-use embedded_hal::i2c::ErrorType;
-use embedded_hal::i2c::I2c;
-use std::fmt::Debug;
-use std::ops::Deref;
-
 use ahtx0::blocking::AHTx0 as Aht20;
-use embedded_hal::i2c::Error as I2cError;
+use anyhow::Result;
+use embedded_hal::i2c::{Error as I2cError, ErrorType, I2c};
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::io::Read;
-use esp_idf_hal::io::Write;
-use esp_idf_hal::{gpio::PinDriver, prelude::Peripherals};
 use esp_idf_sys as _;
 use log::*;
 
-pub struct AHT21Sensor<I2C>
-where
-    I2C: embedded_hal::i2c::I2c,
-{
+pub struct AHT21Sensor<I2C: I2c> {
     sensor: Aht20<I2C>,
 }
 
 #[derive(Debug)]
-pub enum AHT21Error<E: Debug> {
+pub enum AHT21Error<E>
+where
+    E: std::fmt::Debug,
+{
     I2CError(E),
     SensorError,
     DataNotReady,
 }
 
-impl<E: Debug> From<E> for AHT21Error<E> {
+impl<E> From<E> for AHT21Error<E>
+where
+    E: std::fmt::Debug,
+{
     fn from(err: E) -> Self {
         AHT21Error::I2CError(err)
     }
 }
-
-impl<E: Debug> std::fmt::Display for AHT21Error<E> {
+impl<E> std::fmt::Display for AHT21Error<E>
+where
+    E: std::fmt::Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AHT21Error::I2CError(e) => write!(f, "I2C error: {:?}", e),
@@ -43,10 +40,7 @@ impl<E: Debug> std::fmt::Display for AHT21Error<E> {
     }
 }
 
-impl<E> I2cError for AHT21Error<E>
-where
-    E: core::fmt::Debug + I2cError,
-{
+impl<E: I2cError> I2cError for AHT21Error<E> {
     fn kind(&self) -> embedded_hal::i2c::ErrorKind {
         match self {
             AHT21Error::I2CError(e) => e.kind(),
@@ -55,35 +49,27 @@ where
     }
 }
 
-impl<I2C, E: I2cError> ErrorType for AHT21Sensor<I2C>
-where
-    I2C: embedded_hal::i2c::I2c<Error = E>,
-{
-    type Error = AHT21Error<E>;
+impl<I2C: I2c> ErrorType for AHT21Sensor<I2C> {
+    type Error = AHT21Error<I2C::Error>;
 }
 
-impl<I2C, E> AHT21Sensor<I2C>
+impl<I2C: I2c> AHT21Sensor<I2C>
 where
-    I2C: embedded_hal::i2c::I2c<Error = E>,
-    E: embedded_hal::i2c::Error + Debug,
+    I2C::Error: std::fmt::Debug,
 {
-    pub fn new(i2c: I2C) -> Result<Self, AHT21Error<E>> {
-        log::info!("Initializing AHT21 sensor");
-        // let mut sensor = Aht20::new(i2c).map_err(|e| AHT21Error::SensorError)?;
+    pub fn new(i2c: I2C) -> Result<Self, ahtx0::Error<I2C::Error>> {
+        info!("Initializing AHT21 sensor");
         let mut sensor = Aht20::new(i2c);
-        FreeRtos::delay_ms(100); // Allow sensor to stabilize
-        let _ = sensor.calibrate(&mut FreeRtos);
         FreeRtos::delay_ms(100);
-        let device_id = sensor
-            .state()
-            .inspect_err(|e| log::error!("failed to read state: {:?}", e));
-        log::info!("device state = {:?}", device_id);
-        Ok(AHT21Sensor { sensor })
+        sensor.calibrate(&mut FreeRtos)?;
+        FreeRtos::delay_ms(100);
+        info!("device state = {:?}", sensor.state()?);
+        Ok(Self { sensor })
     }
 
-    pub fn get_data(&mut self) -> Result<(f32, f32), AHT21Error<E>> {
+    pub fn get_data(&mut self) -> Result<(f32, f32), AHT21Error<I2C::Error>> {
         let measurement = self.sensor.measure(&mut FreeRtos).map_err(|e| {
-            log::error!("Failed to measure AHT21 sensor: {:?}", e);
+            error!("Failed to measure AHT21 sensor: {:?}", e);
             AHT21Error::SensorError
         })?;
         Ok((

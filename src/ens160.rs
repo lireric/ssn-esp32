@@ -70,12 +70,12 @@ where
     pub fn new(i2c: I2C) -> Result<Self, Ens160Error<E>> {
         log::info!("initialize device Ens160");
         let mut sensor = Ens160::new(i2c, 0x53);
-        let (a, b, c) = sensor.firmware_version().unwrap();
+        let (a, b, c) = sensor.firmware_version()?;
         log::info!("firmware version of the sensor: {}.{}.{}", a, b, c);
-        sensor.reset().unwrap();
+        sensor.reset()?;
         FreeRtos::delay_ms(250);
         log::info!("go to operational mode sensor Ens160");
-        sensor.operational().unwrap();
+        sensor.operational()?;
         Ok(ENS160Sensor { sensor })
     }
 
