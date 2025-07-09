@@ -1,10 +1,10 @@
-use bincode::{config, Decode, Encode};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, EspNvsPartition, NvsDefault};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io::{Error, ErrorKind};
 
-#[derive(Serialize, Deserialize, Debug, Encode, Decode, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 
 pub struct Config {
     pub account: String,
@@ -20,15 +20,19 @@ pub struct Config {
     pub ssn_wifi_pass: String,
 }
 
+pub struct Settings {
+    nvs: EspNvs<NvsDefault>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             account: "3".to_string(),
             object: "2".to_string(), // esp32-test
-            mqtt_host: "192.168.1.105".to_string(),
+            mqtt_host: "192.168.3.150".to_string(),
             mqtt_user: "mosquitto".to_string(),
             mqtt_pass: "test".to_string(),
-            wifi_ssid: "lir".to_string(),
+            wifi_ssid: "lir2".to_string(),
             wifi_psk: "springrain".to_string(),
             mqtt_client_id: "esp_client_id_12345".to_string(),
             ssn_id: "123".to_string(),
@@ -65,53 +69,45 @@ impl fmt::Display for Config {
     }
 }
 
-struct Buffer {
-    raw_data: Vec<u8>,
-}
+impl Settings {
+    pub fn new(nvs: EspNvs<NvsDefault>) -> Self {
+        Settings { nvs }
+    }
+    pub fn get_config(&mut self) -> Result<(Config, usize), Error> {
+        let mut buf = [0u8; 1024];
 
-pub fn get_config(mut nvs: EspNvs<NvsDefault>) -> (Config, usize) {
-    // Check if config exists in NVS
-    let bincode_config = bincode::config::standard();
-    // const MAX_BUF_LEN: usize = 10000;
-    // let mut stored_data: [u8; MAX_BUF_LEN] = [0; MAX_BUF_LEN];
-    // let mut stored_data: Vec<u8> = vec![];
-    // let app_config = match nvs.get_raw("config", &mut stored_data) {
-    //     Ok(Some(v)) => {
-    //         // Deserialize the stored config
-    //         bincode::deserialize(&v).unwrap()
-    //     }
-    //     Ok(None) | Err(_) => {
-    //         // If config does not exist, create a default config and store it
-    //         let default_config = Config::default();
-    //         let serialized = bincode::serialize(&default_config).unwrap();
-    //         nvs.set_blob("config", &serialized).unwrap();
-    //         println!("Stored default config in NVS.");
-    //         default_config
-    //     }
-    // };
-
-    // Define a buffer to store the serialized data
-    let mut b: Buffer = Buffer { raw_data: (vec![]) };
-
-    // Step 1: Get the blob from NVS
-    let blob_result = nvs.get_blob("config", &mut b.raw_data);
-
-    // Step 2: Deserialize the stored data into app_config
-    let (app_config, app_config_size) = match blob_result {
-        Ok(Some(v)) => {
-            // Deserialize the stored config
-            // bincode::decode_from_slice::<Config>(&v, bincode_config).unwrap()
-            log::info!("Loaded config from NVS.");
-            bincode::decode_from_slice(v, bincode_config).unwrap()
+        match self.nvs.get_blob("config", &mut buf) {
+            Ok(Some(blob)) => {
+                log::info!("Config found in NVS, size: {}", blob.len());
+                match serde_json::from_slice(blob) {
+                    Ok(config) => {
+                        log::debug!("Loaded config: {:?}", config);
+                        Ok((config, blob.len()))
+                    }
+                    Err(e) => {
+                        log::error!("Config deserialization failed: {}", e);
+                        self.set_default_config()
+                    }
+                }
+            }
+            _ => {
+                log::warn!("No config found, creating default");
+                self.set_default_config()
+            }
         }
-        Ok(None) | Err(_) => {
-            // If config does not exist, create a default config and store it
-            let default_config = Config::default();
-            let serialized = bincode::encode_to_vec(&default_config, bincode_config).unwrap();
-            nvs.set_blob("config", &serialized).unwrap();
-            log::info!("Stored default config in NVS.");
-            (default_config, 0) // TO DO: get real size..
-        }
-    };
-    (app_config, app_config_size)
+    }
+
+    fn set_default_config(&mut self) -> Result<(Config, usize), Error> {
+        let default_config = Config::default();
+        let json = serde_json::to_vec(&default_config).map_err(|e| {
+            log::error!("Failed to serialize default config: {}", e);
+            Error::new(ErrorKind::InvalidData, e)
+        })?;
+        self.nvs.set_blob("config", &json).map_err(|e| {
+            log::error!("Failed to store default config: {}", e);
+            Error::new(ErrorKind::Other, e)
+        })?;
+        log::info!("Default config stored, size: {}", json.len());
+        Ok((default_config, json.len()))
+    }
 }

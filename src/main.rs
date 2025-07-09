@@ -49,6 +49,7 @@ use esp_idf_hal::gpio::{ADCPin, Gpio0, Gpio1, Gpio2, Gpio3, Gpio4, Gpio5, Output
 use esp_idf_hal::prelude::*; // For peripheral access
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
+    sys::{esp_wifi_get_mac, esp_base_mac_addr_set, esp_efuse_mac_get_default},
     hal::{
         adc::ADC1,
         delay,
@@ -79,6 +80,8 @@ mod ssn_wifi;
 use bincode::{config, Decode, Encode};
 use serde::{Deserialize, Serialize};
 mod settings;
+use settings::{Settings, Config};
+
 use log::{info, warn};
 
 use lazy_static::lazy_static;
@@ -579,6 +582,18 @@ fn pop_command(data: &SharedSsnDeviceCommand) -> Option<SsnDeviceCommand> {
     guard.pop()
 }
 
+fn get_mac_address() -> String {
+    let mut mac_address = [0u8; 6];
+    
+    // Read base MAC from eFuse
+    unsafe { esp_efuse_mac_get_default(mac_address.as_mut_ptr()) };
+    format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            mac_address[0], mac_address[1], mac_address[2],
+            mac_address[3], mac_address[4], mac_address[5]
+        )
+}
+
 // =====================================================================================
 // Main logic that might return an error
 fn main_logic() -> Result<()> {
@@ -614,17 +629,27 @@ fn main_logic() -> Result<()> {
         }
         Err(e) => panic!("Could't get namespace {}", e),
     };
+    let mut settings = Settings::new(nvs);
+    // let mut app_config: Config;
+    let mut app_config_size: usize;
 
-    let (mut app_config, app_config_size) = settings::get_config(nvs);
-    let mac = esp_idf_svc::sys::MACSTR;
+    // let (mut app_config, app_config_size) = settings::get_config(nvs);
+    // match settings.get_config() {
+    //     Ok((app_config, app_config_size)) => println!("Loaded config (size: {}): {:?}", app_config_size, app_config),
+    //     Err(e) => println!("Error loading config: {}", e),
+    // }
+
+    let (mut app_config, app_config_size) = settings.get_config().unwrap_or_else(|e| {
+        panic!("Failed to get config: {}", e);
+    });
+
+    // let mac = esp_idf_svc::sys::MACSTR;
     // ********************************************
     // override default settings:
     app_config.account = "3".to_string();
     app_config.object = "2".to_string();
-    app_config.ssn_id = format!(
-        "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    );
+    app_config.ssn_id = get_mac_address();
+
     app_config.ssn_wifi_ssid = format!("ssn_{}", app_config.ssn_id);
     app_config.ssn_wifi_pass = "ssn123456".to_string();
     app_config.mqtt_client_id = format!("ssn_esp_{}", app_config.ssn_id);
@@ -670,25 +695,24 @@ fn main_logic() -> Result<()> {
     // ADC ---------------------------------------------
     let adc1 = peripherals.adc1;
 
-    // ssn_devices.push(SsnDevice {
-    let new_device = SsnDevice {
-        dev_id: "adc-test".to_string(),
-        is_active: true,
-        is_paused: false,
-        period: SsnSensorPeriod::Fast,
-        device: SsnDevices::Adc {
-            raw_value: 0,
-            voltage_mv: 0.0,
-            raw_value_delta: 1.0, // 1%
-            raw_value_last_sent_value: Some(0),
-            raw_value_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-            sensor: Box::new(AdcReader::new(peripherals.pins.gpio4, adc1)
-                .context("Failed to create ADC reader")?),
-            delta_over: Some(50.0),
-            voltage_value_last_sent_value: Some(0.0),
-        },
-    };
-    SsnDevice::add_shared_device(&mut shared_devices, new_device);
+    // let new_device = SsnDevice {
+    //     dev_id: "adc-test".to_string(),
+    //     is_active: true,
+    //     is_paused: false,
+    //     period: SsnSensorPeriod::Fast,
+    //     device: SsnDevices::Adc {
+    //         raw_value: 0,
+    //         voltage_mv: 0.0,
+    //         raw_value_delta: 1.0, // 1%
+    //         raw_value_last_sent_value: Some(0),
+    //         raw_value_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+    //         sensor: Box::new(AdcReader::new(peripherals.pins.gpio4, adc1)
+    //             .context("Failed to create ADC reader")?),
+    //         delta_over: Some(50.0),
+    //         voltage_value_last_sent_value: Some(0.0),
+    //     },
+    // };
+    // SsnDevice::add_shared_device(&mut shared_devices, new_device);
 
     // let pins = peripherals.pins;
     let scl = peripherals.pins.gpio0;
@@ -752,7 +776,37 @@ fn main_logic() -> Result<()> {
     // let mut pin_b = Box::new(PinDriver::output(peripherals.pins.gpio5)?);
     // pin_b.set_high();
 
-        SsnDevice::add_shared_device(
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "gpio-out3".to_string(),
+            period: SsnSensorPeriod::Fast,
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::GpioOutput { data: false,
+                 delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
+                 last_sent_value: None, 
+                //  sensor: peripherals.pins.gpio5.into(),
+                 sensor: Box::new(PinDriver::input_output(peripherals.pins.gpio3)?),
+                },
+        },
+    );        
+    SsnDevice::add_shared_device(
+        &mut shared_devices,
+        SsnDevice {
+            dev_id: "gpio-out4".to_string(),
+            period: SsnSensorPeriod::Fast,
+            is_active: true,
+            is_paused: false,
+            device: SsnDevices::GpioOutput { data: false,
+                 delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
+                 last_sent_value: None, 
+                //  sensor: peripherals.pins.gpio5.into(),
+                 sensor: Box::new(PinDriver::input_output(peripherals.pins.gpio4)?),
+                },
+        },
+    );        
+    SsnDevice::add_shared_device(
         &mut shared_devices,
         SsnDevice {
             dev_id: "gpio-out5".to_string(),
@@ -775,7 +829,7 @@ fn main_logic() -> Result<()> {
             is_active: true,
             is_paused: false,
             device: SsnDevices::GpioInput { data: 0,
-                 delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
+                 delta: 1.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
                  last_sent_value: None, 
                  interrupt_type: InterruptType::AnyEdge,
                  pull_type: Pull::Up,
@@ -787,57 +841,58 @@ fn main_logic() -> Result<()> {
                 
         },
     );
-    SsnDevice::add_shared_device(
-        &mut shared_devices,
-        SsnDevice {
-            dev_id: "gpio-in7".to_string(),
-            period: SsnSensorPeriod::Fast,
-            is_active: true,
-            is_paused: false,
-            device: SsnDevices::GpioInput { data: 0,
-                 delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
-                 last_sent_value: None, 
-                 interrupt_type: InterruptType::AnyEdge,
-                 pull_type: Pull::Up,
-                 sensor: Box::new(PinDriver::input(peripherals.pins.gpio7)?),
-                notificator: notification_clone.clone(),
-                counter: 0,
-                last_sent_counter: None,
-                },
+    // SsnDevice::add_shared_device(
+    //     &mut shared_devices,
+    //     SsnDevice {
+    //         dev_id: "gpio-in7".to_string(),
+    //         period: SsnSensorPeriod::Fast,
+    //         is_active: true,
+    //         is_paused: false,
+    //         device: SsnDevices::GpioInput { data: 0,
+    //              delta: 0.0, delta_over: None, last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30), 
+    //              last_sent_value: None, 
+    //              interrupt_type: InterruptType::AnyEdge,
+    //              pull_type: Pull::Up,
+    //              sensor: Box::new(PinDriver::input(peripherals.pins.gpio7)?),
+    //             notificator: notification_clone.clone(),
+    //             counter: 0,
+    //             last_sent_counter: None,
+    //             },
                 
-        },
-    );
-    match AHT21Sensor::new(SharedI2c::new(i2c_lock.clone())) {
-        Ok(sensor) => {
-            SsnDevice::add_shared_device(
-                &mut shared_devices,
-                SsnDevice {
-                    dev_id: "aht21-test".to_string(),
-                    period: SsnSensorPeriod::Middle,
-                    is_active: true,
-                    is_paused: false,
-                    device: SsnDevices::Aht21 {
-                        temperature: 0.0,
-                        temperature_delta: 0.5,
-                        temperature_last_sent_value: None,
-                        temperature_last_update: Instant::now()
-                            - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-                        humidity: 0.0,
-                        humidity_delta: 0.5,
-                        humidity_last_sent_value: None,
-                        humidity_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
-                        sensor,
-                        temperature_delta_over: Some(30.0),
-                        humidity_delta_over: Some(30.0),
-                    },
-                },
-            );
-        }
-        Err(e) => {
-            log::error!("Failed to initialize AHT21 sensor: {:?}", e);
-            // return Err(anyhow::Error::msg(format!("AHT21 init error: {}", e)));
-        }
-    };
+    //     },
+    // );
+
+    // match AHT21Sensor::new(SharedI2c::new(i2c_lock.clone())) {
+    //     Ok(sensor) => {
+    //         SsnDevice::add_shared_device(
+    //             &mut shared_devices,
+    //             SsnDevice {
+    //                 dev_id: "aht21-test".to_string(),
+    //                 period: SsnSensorPeriod::Middle,
+    //                 is_active: true,
+    //                 is_paused: false,
+    //                 device: SsnDevices::Aht21 {
+    //                     temperature: 0.0,
+    //                     temperature_delta: 0.5,
+    //                     temperature_last_sent_value: None,
+    //                     temperature_last_update: Instant::now()
+    //                         - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+    //                     humidity: 0.0,
+    //                     humidity_delta: 0.5,
+    //                     humidity_last_sent_value: None,
+    //                     humidity_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+    //                     sensor,
+    //                     temperature_delta_over: Some(30.0),
+    //                     humidity_delta_over: Some(30.0),
+    //                 },
+    //             },
+    //         );
+    //     }
+    //     Err(e) => {
+    //         log::error!("Failed to initialize AHT21 sensor: {:?}", e);
+    //         // return Err(anyhow::Error::msg(format!("AHT21 init error: {}", e)));
+    //     }
+    // };
 
     match ens160::ENS160Sensor::new(shared_i2c) {
         Ok(sensor) => {
@@ -875,10 +930,12 @@ fn main_logic() -> Result<()> {
         }
     };
 
-    SsnDevice::add_shared_device(
+    match bmp180::BMP180Sensor::new(SharedI2c::new(i2c_lock.clone()), FreeRtos) {
+        Ok(sensor) => {
+            SsnDevice::add_shared_device(
         &mut shared_devices,
         SsnDevice {
-            dev_id: "bmp180-test".to_string(),
+            dev_id: "bmp180".to_string(),
             period: SsnSensorPeriod::Slow,
             is_active: true,
             is_paused: false,
@@ -893,34 +950,46 @@ fn main_logic() -> Result<()> {
                 pressure_last_sent_value: None,
                 pressure_last_update: Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30),
                 altitude: (0.0),
-                sensor: (bmp180::BMP180Sensor::new(SharedI2c::new(i2c_lock.clone()), FreeRtos)?),
+                        sensor,
                 temperature_delta_over: Some(10.0),
                 pressure_delta_over: Some(5.0),
             },
         },
-    );
+        );
+        }
+        Err(e) => {
+            log::error!("Failed to initialize BMP180 sensor: {:?}", e);
+        }
+    };
 
-    SsnDevice::add_shared_device(
-        &mut shared_devices,
-        SsnDevice {
-            dev_id: "store_int-test".to_string(),
-            period: SsnSensorPeriod::Fast,
-            is_active: true,
-            is_paused: false,
-            device: SsnDevices::StoreInt {
-                data: HashMap::new(),
-                delta: 1.0,
-                last_sent_value: HashMap::new(),
-                last_update: HashMap::new(),
-                delta_over: None,
-            },
-        },
-    );
+    // SsnDevice::add_shared_device(
+    //     &mut shared_devices,
+    //     SsnDevice {
+    //         dev_id: "store_int-test".to_string(),
+    //         period: SsnSensorPeriod::Fast,
+    //         is_active: true,
+    //         is_paused: false,
+    //         device: SsnDevices::StoreInt {
+    //             data: HashMap::new(),
+    //             delta: 1.0,
+    //             last_sent_value: HashMap::new(),
+    //             last_update: HashMap::new(),
+    //             delta_over: None,
+    //         },
+    //     },
+    // );
 
     // ---------------------------- Alarms:
     add_alarm(
-        FixedOffset::east_opt(DEF_TZ * 3600).unwrap().with_ymd_and_hms(2025, 8, 2, 0, 25, 0).unwrap(),
-        20,
+        FixedOffset::east_opt(DEF_TZ * 3600).unwrap().with_ymd_and_hms(2025, 8, 2, 14, 45, 0).unwrap(),
+        10,
+        "gpio-out4".to_string(),
+        1,
+        0
+    );
+    add_alarm(
+        FixedOffset::east_opt(DEF_TZ * 3600).unwrap().with_ymd_and_hms(2025, 8, 2, 14, 46, 0).unwrap(),
+        10,
         "gpio-out5".to_string(),
         1,
         0
@@ -1067,7 +1136,7 @@ fn main_logic() -> Result<()> {
         }
     })?;
 
-    std::thread::sleep(Duration::from_millis(4000));
+    std::thread::sleep(Duration::from_millis(6000));
     // Subscribe to topics
     for topic in topics_to_subscribe {
         info!("MQTT subscribe to {}", &topic);
@@ -1677,7 +1746,7 @@ fn main_logic() -> Result<()> {
             time_counter_middle = Instant::now();
         }
 
-        FreeRtos::delay_ms(1500); // Wait 500ms
+        FreeRtos::delay_ms(500); // Wait 500ms
     }
 }
 
