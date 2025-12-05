@@ -1,5 +1,6 @@
 use adc_reader::AdcReaderTrait;
 // #![cfg(feature = "smart-leds-trait")]
+use log;
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use chrono::FixedOffset;
@@ -31,7 +32,6 @@ use esp_idf_svc::mqtt::client::EventPayload;
 use esp_idf_svc::sntp::{EspSntp, SyncMode};
 use esp_idf_svc::sys::MACSTR;
 
-use log::error;
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -82,7 +82,6 @@ use serde::{Deserialize, Serialize};
 mod settings;
 use settings::{Settings, Config};
 
-use log::{info, warn};
 
 use lazy_static::lazy_static;
 
@@ -105,6 +104,11 @@ mod aht21;
 use aht21::AHT21Sensor;
 
 mod utils;
+
+mod ssndevices;
+use ssndevices::{SsnDevice, SsnDevices, SharedSsnDevice, create_shared_devices, PinDriverBasicInput, PinDriverTraitOutput};
+
+use crate::ssndevices::SsnSensorPeriod;
 
 // ----------------------------------
 // if sensor value is not changed in this period mqtt message will by sended anyway
@@ -252,140 +256,6 @@ impl I2c for SharedI2c {
     }
 }
 
-enum SsnSensorPeriod {
-    Fast,
-    Middle,
-    Slow,
-}
-
-enum SsnDevices<'a> {
-    Bmp {
-        sensor_type: bmp::SensorType,
-        temperature: f64,
-        temperature_delta: f64, // delta between previous and new measurments for trigger sending mqtt message%
-        temperature_delta_over: Option<f64>, // Skip if temperature exceeds this value (None = no limit)
-        temperature_last_update: Instant,
-        temperature_last_sent_value: Option<f64>,
-        pressure: i32,
-        pressure_delta: f64,
-        pressure_delta_over: Option<f64>, // Skip if pressure exceeds this value (None = no limit)
-        pressure_last_update: Instant,
-        pressure_last_sent_value: Option<f64>,
-        humidity: Option<f64>,
-        humidity_delta: f64,
-        humidity_delta_over: Option<f64>, // Skip if humidity exceeds this value (%)
-        humidity_last_update: Instant,
-        humidity_last_sent_value: Option<f64>,
-        sensor: bmp::BMPSensor<SharedI2c, esp_idf_hal::delay::FreeRtos>,
-    },
-    Bmp180 {
-        temperature: f32,
-        temperature_delta: f32, // delta between previous and new measurments for trigger sending mqtt message%
-        temperature_delta_over: Option<f32>, // Skip if temperature exceeds this value (None = no limit)
-        temperature_last_update: Instant,
-        temperature_last_sent_value: Option<f32>,
-        pressure: i32,
-        pressure_delta: f32,
-        pressure_delta_over: Option<f32>, // Skip if pressure exceeds this value (None = no limit)
-        pressure_last_update: Instant,
-        pressure_last_sent_value: Option<i32>,
-        altitude: f32,
-        // sensor: BMP180Sensor<esp_idf_hal::i2c::I2cDriver<'static>, esp_idf_hal::delay::FreeRtos>,
-        sensor: BMP180Sensor<SharedI2c, esp_idf_hal::delay::FreeRtos>,
-    },
-    Ens160 {
-        co2eq_ppm: i16,
-        co2eq_delta: f32,
-        co2eq_delta_over: Option<f32>, // Skip if CO2 exceeds this threshold (ppm)
-        co2eq_last_update: Instant,
-        co2eq_last_sent_value: Option<i16>,
-        tvoc_ppb: i16,
-        tvoc_delta: f32,
-        tvoc_delta_over: Option<f32>, // Skip if TVOC exceeds this threshold (ppb)
-        tvoc_last_update: Instant,
-        tvoc_last_sent_value: Option<i16>,
-        aqi: i8,
-        aqi_delta: f32,
-        aqi_delta_over: Option<f32>, // Skip if AQI exceeds this threshold
-        aqi_last_update: Instant,
-        aqi_last_sent_value: Option<i8>,
-        // sensor: ENS160Sensor<esp_idf_hal::i2c::I2cDriver<'static>>,
-        sensor: ENS160Sensor<SharedI2c>,
-    },
-    Adc {
-        raw_value: u16,
-        raw_value_delta: f32,
-        delta_over: Option<f32>,
-        raw_value_last_update: Instant,
-        raw_value_last_sent_value: Option<u16>,
-        voltage_value_last_sent_value: Option<f32>,
-        voltage_mv: f32,
-        sensor: Box<dyn AdcReaderTrait + 'a>,
-    },
-    Aht21 {
-        temperature: f32,
-        temperature_delta: f32, // delta between previous and new measurments for trigger sending mqtt message%
-        temperature_delta_over: Option<f32>, // Skip if temperature exceeds this value (°C)
-        temperature_last_update: Instant,
-        temperature_last_sent_value: Option<f32>,
-        humidity: f32,
-        humidity_delta: f32,
-        humidity_delta_over: Option<f32>, // Skip if humidity exceeds this value (%)
-        humidity_last_update: Instant,
-        humidity_last_sent_value: Option<f32>,
-        sensor: AHT21Sensor<SharedI2c>,
-    },
-    StoreInt {
-        data: HashMap<String, i32>,
-        delta: f32,
-        delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
-        last_update: HashMap<String, Instant>,
-        last_sent_value: HashMap<String, Option<i32>>,
-    },
-    GpioInput {
-        data: u8,
-        delta: f32,
-        interrupt_type: InterruptType,
-        notificator: Arc<Notification>,
-        counter: u32,
-        pull_type: Pull,
-        delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
-        last_update: Instant,
-        last_sent_value: Option<u8>,
-        last_sent_counter: Option<u32>,
-        sensor: Box<dyn PinDriverBasicInput + 'static>,
-    },
-    GpioOutput {
-        data: bool,
-        delta: f32,
-        delta_over: Option<f32>, // Skip if value exceeds this threshold (None = no limit)
-        last_update: Instant,
-        last_sent_value: Option<bool>,
-        sensor:  Box<dyn PinDriverTraitOutput + 'a>,
-    },
-}
-
-pub trait PinDriverBasicInput: Any+Send {
-    fn set_pull(&mut self, pull: Pull)-> Result<(), esp_idf_sys::EspError>;
-    fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError>;
-    fn set_interrupt_type(&mut self, interript_type: InterruptType) -> Result<(), esp_idf_sys::EspError>;
-    // fn subscribe_boxed(&mut self, callback: Box<dyn FnMut() + Send + 'static>) -> Result<(), EspError>;
-    fn subscribe_boxed(&mut self, nf: Arc<Notification>) -> Result<(), EspError>;
-    fn enable_interrupt(&mut self) -> Result<(), esp_idf_sys::EspError>;
-    fn get_pin(&mut self) -> Result<i32, esp_idf_sys::EspError>;
-}
-
-impl dyn PinDriverBasicInput {
-    pub fn as_any(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-// pub trait PinDriverInterrupt: PinDriverBasicInput {
-//     // fn subscribe<F>(&mut self, callback: F) -> Result<(), esp_idf_sys::EspError> where
-//     //     F: FnMut() + 'static  + Send;
-//         fn subscribe_boxed(&mut self, callback: Box<dyn FnMut() + Send + 'static>) -> Result<(), EspError>;
-//     }
-
 impl<T: Pin + InputPin + OutputPin> PinDriverBasicInput for PinDriver<'static, T, Input> {
     fn get_pin(&mut self) -> Result<i32, esp_idf_sys::EspError> {
         Ok(PinDriver::pin(self))
@@ -423,27 +293,6 @@ impl<T: Pin + InputPin + OutputPin> PinDriverBasicInput for PinDriver<'static, T
     }
 }
 
-pub trait PinDriverTraitOutput {
-    fn set_pull(&mut self, pull: Pull)-> Result<(), esp_idf_sys::EspError>;
-    fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError>;
-    fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError>;
-    fn set_low(&mut self) -> Result<(), esp_idf_sys::EspError>;
-}
-impl<'d, T: Pin + InputPin + OutputPin> PinDriverTraitOutput for PinDriver<'d, T, InputOutput> {
-    fn set_high(&mut self) -> Result<(), esp_idf_sys::EspError> {
-        PinDriver::set_high(self)
-    }
-    fn set_low(&mut self) -> Result<(), esp_idf_sys::EspError> {
-        PinDriver::set_low(self)
-    }
-    fn set_pull(&mut self, pull: Pull) -> Result<(), esp_idf_sys::EspError>{
-        PinDriver::set_pull(self, pull)
-    }
-    
-    fn get_value(&mut self) -> Result<bool, esp_idf_sys::EspError> {
-        Ok(PinDriver::get_level(self) == Level::High)
-    }
-}
 
 #[derive(Debug)]
 pub struct SsnChannelInfo {
@@ -451,89 +300,6 @@ pub struct SsnChannelInfo {
     pub name: &'static str,
     pub description: &'static str,
 }
-
-impl <'a> SsnDevices <'a>{
-    // pub fn get_value_by_channel(
-    //     devices: &[SsnDevice],
-    //     dev_id: &str,
-    //     channel_index: usize,
-    // ) -> Option<f32> {
-    //     devices
-    //         .iter()
-    //         .find(|d| d.dev_id == dev_id)
-    //         .and_then(|device| device.get_value_by_channel(channel_index))
-    // }
-}
-impl<'a> SsnDevice<'a> {
-    pub fn get_device_by_id<'b>(
-        devices: &'b[SharedSsnDevice<'b>],
-        dev_id: &str,
-    ) -> Option<SharedSsnDevice<'b>> {
-        devices
-            .iter()
-            .find(|d| d.lock().unwrap().dev_id == dev_id)
-            .map(Arc::clone)
-    }
-    // func is called at device creating:
-    pub fn dev_init(&mut self) {
-        log::info!("device {} preinit", self.dev_id);
-        match &mut self.device {
-            SsnDevices::GpioInput { data, delta, interrupt_type, pull_type, delta_over, last_update, last_sent_value, sensor, notificator, counter, last_sent_counter } => {
-                log::info!("GpioInput preinit set_pull={:?}, interrupt_type={:?}", *pull_type, *interrupt_type);
-                let _ = sensor.set_pull(*pull_type);
-                let _ = sensor.set_interrupt_type(*interrupt_type);
-
-                log::info!("GpioInput subscribe callback and enable interrupt");
-                // let _ = sensor.subscribe_boxed(Box::new(|| interrupt_handler_gpio_t()));
-                let _ = sensor.subscribe_boxed(notificator.clone());
-                let _ = sensor.enable_interrupt();
-
-                // if let Some(base) = sensor.as_any().downcast_mut::<Box<dyn PinDriverInterrupt>>() {
-                //     log::info!("GpioInput subscribe int callback");
-                //     let _ = base.subscribe_boxed(Box::new(|| interrupt_handler_gpio_t()));
-                // }
-            },
-            SsnDevices::GpioOutput { data, delta, delta_over, last_update, last_sent_value, sensor } => {
-                // let _ = sensor.set_pull(*pull_type);
-            },
-            _ => (),
-        }
-    }
-}
-
-// #[derive(Default)]
-struct SsnDevice <'a>{
-    dev_id: String,
-    period: SsnSensorPeriod,
-    is_active: bool,
-    is_paused: bool,
-    device: SsnDevices<'a>,
-}
-type SharedSsnDevice <'a>= Arc<Mutex<SsnDevice<'a>>>;
-
-fn create_shared_devices(
-    devices: Vec<SsnDevice>,
-) -> Vec<SharedSsnDevice> {
-    devices
-        .into_iter()
-        .map(|d| Arc::new(Mutex::new(d)))
-        .collect()
-}
-
-impl <'a>SsnDevice <'a>{
-    pub fn add_shared_device(devices: &mut Vec<SharedSsnDevice<'a>>, mut new_device: SsnDevice<'a>) {
-        new_device.dev_init(); // preinit device if needed
-        devices.push(Arc::new(Mutex::new(new_device)));
-    }
-}
-
-// fn read_device_value(
-//     device: &SharedSsnDevice,
-//     channel: usize,
-// ) -> Option<f32> {
-//     let guard = device.lock().unwrap(); // Blocks until lock acquired
-//     guard.get_value_by_channel(channel)
-// }
 
 type SharedSensorData = Arc<Mutex<HashMap<String, Vec<f32>>>>;
 
@@ -564,6 +330,15 @@ type SharedSsnDeviceCommand = Arc<Mutex<Vec<SsnDeviceCommand>>>;
 fn create_commands_array() -> SharedSsnDeviceCommand {
     Arc::new(Mutex::new(Vec::new()))
 }
+
+struct SsnMqttCommand {
+    topic: String,
+    message: String,
+}
+type SharedSsnMqttCommand = Arc<Mutex<Vec<SsnMqttCommand>>>;
+fn create_mqtt_commands_array() -> SharedSsnMqttCommand {
+    Arc::new(Mutex::new(Vec::new()))
+}
 // push command
 fn push_command(data: &SharedSsnDeviceCommand, command: SsnDeviceCommand) -> Result<()> {
     let mut guard = data.lock().unwrap();
@@ -578,6 +353,23 @@ fn push_command(data: &SharedSsnDeviceCommand, command: SsnDeviceCommand) -> Res
 }
 // push command
 fn pop_command(data: &SharedSsnDeviceCommand) -> Option<SsnDeviceCommand> {
+    let mut guard = data.lock().unwrap();
+    guard.pop()
+}
+
+// push mqtt command
+fn push_mqtt_command(data: &SharedSsnMqttCommand, command: SsnMqttCommand) -> Result<()> {
+    let mut guard = data.lock().unwrap();
+    log::info!(
+        "push_command: command={}, message={}",
+        command.topic,
+        command.message
+    );
+    guard.push(command);
+    Ok(())
+}
+// push command
+fn pop_mqtt_command(data: &SharedSsnMqttCommand) -> Option<SsnMqttCommand> {
     let mut guard = data.lock().unwrap();
     guard.pop()
 }
@@ -612,10 +404,28 @@ fn main_logic() -> Result<()> {
     let commands_array = create_commands_array();
     let commands_array_ref = commands_array.clone();
 
+    let mqtt_commands_array = create_mqtt_commands_array();
+    let mqtt_commands_array_ref = mqtt_commands_array.clone();
+
     // Create a notification handle for the interrupt
     let notification = Arc::new(Notification::new());
     let notification_clone = notification.clone();
 
+    // ----------------------------------------------------- init periferals:
+    let peripherals = esp_idf_hal::peripherals::Peripherals::take().unwrap();
+    // settings reset button:
+    // if button connect to ground then clean settings by default values
+    let mut settings_reset_button = PinDriver::input(peripherals.pins.gpio8)?;
+    settings_reset_button.set_pull(Pull::Up).unwrap();
+    FreeRtos::delay_ms(100);
+
+    // LED 2812:
+    let led_pin = peripherals.pins.gpio10;
+    let channel = peripherals.rmt.channel0;
+
+    let mut ws2812 = Ws2812Esp32RmtDriver::new(channel, led_pin).unwrap(); // GPIO 10, RMT channel 0
+
+    // ----------------------------------------------------- init settings - begin:
     // Initialize NVS
     let nvs_default_partition: EspNvsPartition<NvsDefault> =
         EspDefaultNvsPartition::take().unwrap();
@@ -630,14 +440,51 @@ fn main_logic() -> Result<()> {
         Err(e) => panic!("Could't get namespace {}", e),
     };
     let mut settings = Settings::new(nvs);
+
+    let is_set_reset = settings_reset_button.is_low();
+    log::info!("Reset button state: {}", is_set_reset);
+
+    if is_set_reset { 
+        log::warn!("Reset settings button pushed! Fill defaults values...");
+        let _ = settings.set_default_config();
+
+        //  *************** TEST *****************
+        let _= settings.set_config_from_json(r#"{
+  "account": "3",
+  "object": "2",
+  "ssn_id": "123",
+  "mqtt_host": "192.168.1.105",
+  "mqtt_user": "mosquitto",
+  "mqtt_pass": "test",
+  "wifi_ssid": "lir",
+  "wifi_psk": "springrain",
+  "mqtt_client_id": "esp_client_id_12345",
+  "ssn_wifi_ssid": "ssn",
+  "ssn_wifi_pass": "ssn123456",
+  "devices": [
+    {
+      "dev_id": "temperature_sensor",
+      "device_type": "Bmp180",
+      "period": "Middle",
+      "is_active": true,
+      "is_paused": false,
+      "temperature_delta_over": 0.5,
+      "pressure_delta_over": 1.0
+    },
+    {
+      "dev_id": "co2_sensor",
+      "device_type": "Ens160",
+      "period": "Fast",
+      "is_active": true,
+      "is_paused": false,
+      "co2eq_delta_over": 10.0,
+      "tvoc_delta_over": 5.0
+    }
+  ]
+}"# );
+    }
     // let mut app_config: Config;
     let mut app_config_size: usize;
-
-    // let (mut app_config, app_config_size) = settings::get_config(nvs);
-    // match settings.get_config() {
-    //     Ok((app_config, app_config_size)) => println!("Loaded config (size: {}): {:?}", app_config_size, app_config),
-    //     Err(e) => println!("Error loading config: {}", e),
-    // }
 
     let (mut app_config, app_config_size) = settings.get_config().unwrap_or_else(|e| {
         panic!("Failed to get config: {}", e);
@@ -656,8 +503,8 @@ fn main_logic() -> Result<()> {
     log::info!("acc={}, obj={}, ssn_id = {}, mqtt_client_id={}", 
         app_config.account, app_config.object, app_config.ssn_id, app_config.mqtt_client_id);
     
-
     let object = app_config.object.clone();
+    let object_ref = app_config.object.clone();
     let account = app_config.account.clone();
     let account_ref = app_config.account.clone();
 
@@ -666,14 +513,7 @@ fn main_logic() -> Result<()> {
         app_config.clone(),
         app_config_size
     );
-
-    let peripherals = esp_idf_hal::peripherals::Peripherals::take().unwrap();
-
-    // LED 2812 ---------------------------------------------
-    let led_pin = peripherals.pins.gpio10;
-    let channel = peripherals.rmt.channel0;
-
-    let mut ws2812 = Ws2812Esp32RmtDriver::new(channel, led_pin).unwrap(); // GPIO 10, RMT channel 0
+    //-------------------------------------------------------------- init settings - end
 
     pub fn status_led(led: &mut Ws2812Esp32RmtDriver, col: Colors) {
         let color = match col {
@@ -1002,9 +842,9 @@ fn main_logic() -> Result<()> {
 
     let topics_to_subscribe = vec![
         format!("/ssn/acc/{}/raw_data", &account),
-        format!("/ssn/acc/{}/obj/{}/commands", &account, &object),
-        format!("/ssn/acc/{}/obj/{}/commands/ini", &account, &object),
-        format!("/ssn/acc/{}/obj/{}/commands/json", &account, &object),
+        format!("/ssn/acc/{}/obj/{}/commands/+", &account, &object),
+        // format!("/ssn/acc/{}/obj/{}/commands/ini", &account, &object),
+        // format!("/ssn/acc/{}/obj/{}/commands/json", &account, &object),
         format!(
             "/ssn/acc/{}/obj/{}/commands/device/+/+/in",
             &account, &object
@@ -1040,51 +880,83 @@ fn main_logic() -> Result<()> {
                     // mqtt_messages::process_message(topic, data);
                     // let (account_rcv, root_token, subtokens) = mqtt_messages::parse_topic(&topic);
 
-                    let float_str = std::str::from_utf8(data).unwrap(); // Convert to string
+                    let payload_str = std::str::from_utf8(data).unwrap(); // Convert to string
+                    log::info!("payload = {:?}", payload_str);
                     if let Some((account_rcv, root_token, subtokens)) = mqtt_messages::parse_topic(topic) {
                         log::info!("account_rcv = {}, root_token = {}, subtokens = {:?}", account_rcv, root_token, subtokens);
                         // filter only our account
                         if account_ref.eq(account_rcv) {
-                            if let Some(parsed) = mqtt_messages::parse_token_array(root_token, subtokens) {
+                            if let Some(parsed) = mqtt_messages::parse_token_array(root_token, &subtokens) {
                                 // Use the parsed HashMap here
                                 log::info!("parsed subtokens HashMap = {:?}", parsed);
                                 match *parsed.get("subToken").unwrap() {
                                     // process hi level commands:
                                     "commands" => {
-                                        // process device operations:
-                                        let device = *parsed.get("device").unwrap();
-                                        let channel = *parsed.get("channel").unwrap();
-                                        match channel.parse::<u8>() {
-                                            Ok(channel_u8) => {
-                                                match *parsed.get("action").unwrap() {
-                                                    "in" => {
-                                                        // process set new device value
-                                                        match float_str.parse::<f32>() {
-                                                            Ok(val) => {
-                                                                log::info!("Parsed float: {}", val);
-                                                                let _ = push_command(
-                                                                    &commands_array_ref.clone(),
-                                                                    SsnDeviceCommand {
-                                                                        dev_id: device.to_string(),
-                                                                        channel: channel_u8,
-                                                                        value: val,
-                                                                    },
-                                                                );
+                                        if let Some(command) = parsed.get("command") {
+                                            log::info!("command = {:?}", command);
+                                            match *command {
+                                                "ini" => {
+                                                    log::info!("command ini ...");
+                                                },
+                                                "get" => {
+                                                    log::info!("command get config ...");
+                                                    // let cur_config = settings.get_config().unwrap();
+                                                    let (cur_config, app_config_size) = settings.get_config().unwrap_or_else(|e| {
+                                                        panic!("Failed to get config: {}", e);
+                                                    });
+                                                    log::info!("config = {:?}", cur_config);
+                                                    let _ = push_mqtt_command(
+                                                        &mqtt_commands_array_ref.clone(), 
+                                                        SsnMqttCommand {
+                                                            topic: mqtt_messages::publish_command_response(&account_ref, &object_ref, command).to_string(),
+                                                            message: cur_config.to_string()
                                                             }
-                                                            Err(e) => {
-                                                                log::info!("Error parsing float: {}", e)
+                                                        );
+                                                },                                                
+                                                &_ => {
+                                                    log::info!("another command ...");
+                                                }
+                                        }
+                                    } else {
+                                        log::info!("command empty...");
+                                        // process device command (this case has 6 subtokens):
+                                        if subtokens.len() == 6 {
+                                                    // process device operations:
+                                                    let device = *parsed.get("device").unwrap();
+                                                    let channel = *parsed.get("channel").unwrap();
+                                                    match channel.parse::<u8>() {
+                                                        Ok(channel_u8) => {
+                                                            match *parsed.get("action").unwrap() {
+                                                                "in" => {
+                                                                    // process set new device value
+                                                                    match payload_str.parse::<f32>() {
+                                                                        Ok(val) => {
+                                                                            log::info!("Parsed float: {}", val);
+                                                                            let _ = push_command(
+                                                                                &commands_array_ref.clone(),
+                                                                                SsnDeviceCommand {
+                                                                                    dev_id: device.to_string(),
+                                                                                    channel: channel_u8,
+                                                                                    value: val,
+                                                                                },
+                                                                            );
+                                                                        }
+                                                                        Err(e) => {
+                                                                            log::info!("Error parsing float: {}", e)
+                                                                        }
+                                                                    }
+                                                                },
+                                                                "reset" => {
+                                                                    // TO DO
+                                                                }, 
+                                                                &_ => {}
+                        
                                                             }
                                                         }
-                                                    },
-                                                    "reset" => {
-                                                        // TO DO
-                                                    }, 
-                                                    &_ => {}
-            
-                                                }
-                                            }
-                                        Err(_) => todo!(),
+                                                    Err(_) => todo!(),
+                                                    }
                                         }
+                                    }
                                     },
                                     &_ => {}
 
@@ -1108,38 +980,38 @@ fn main_logic() -> Result<()> {
                 // }
                 // SsnDevices::get_value_by_channel(&ssn_devices, "aht21-test", 0);
             }
-            EventPayload::Subscribed(id) => info!("Subscribed to id: {}", id),
+            EventPayload::Subscribed(id) => log::info!("Subscribed to id: {}", id),
             EventPayload::Disconnected => {
-                warn!("MQTT disconnected, attempting to reconnect...");
+                log::warn!("MQTT disconnected, attempting to reconnect...");
                 if reconnect_attempts < MAX_RECONNECT_ATTEMPTS {
                     std::thread::sleep(Duration::from_millis(RECONNECT_DELAY_MS));
                     reconnect_attempts += 1;
                     // You'll need to recreate the client here
                     // This might require restructuring to store broker_url and config
                 } else {
-                    error!("Max reconnection attempts reached");
+                    log::error!("Max reconnection attempts reached");
                 }
             }
             EventPayload::BeforeConnect => {
-                info!("MQTT BeforeConnect");
+                log::info!("MQTT BeforeConnect");
                 std::thread::sleep(Duration::from_millis(1000));
             }
             EventPayload::Connected(_) => {
-                info!("MQTT reconnected successfully");
+                log::info!("MQTT reconnected successfully");
                 reconnect_attempts = 0;
             }
             EventPayload::Error(e) => {
-                warn!("MQTT error: {:?}", e);
+                log::warn!("MQTT error: {:?}", e);
                 std::thread::sleep(Duration::from_millis(1000));
             }
-            _ => info!("Received from MQTT: {:?}", message_event.payload()),
+            _ => log::info!("Received from MQTT: {:?}", message_event.payload()),
         }
     })?;
 
     std::thread::sleep(Duration::from_millis(6000));
     // Subscribe to topics
     for topic in topics_to_subscribe {
-        info!("MQTT subscribe to {}", &topic);
+        log::info!("MQTT subscribe to {}", &topic);
         client.subscribe(&topic, QoS::AtLeastOnce)?;
     }
 
@@ -1237,6 +1109,23 @@ fn main_logic() -> Result<()> {
         //     println!("Scheduled task triggered at {:?}", cur_time);
         //     // Your task logic here
         // }
+
+
+        // check messages to mqtt broker:
+        if let Some(command) = pop_mqtt_command(&mqtt_commands_array) {
+            log::info!(
+                "pop_mqtt_command: topic={}, message={}",
+                command.topic,
+                command.message
+            );
+            client.enqueue(
+                    &command.topic,
+                    QoS::AtLeastOnce,
+                    false,
+                    command.message.to_string().as_bytes(),
+                )
+                .map_err(|e| anyhow::anyhow!("MQTT error: {:?}", e))?;
+        }
 
         // check for alarms and make command for device action:
         // check_alarms returm actual dev_id and value only at the moment of timer triggered or canceled

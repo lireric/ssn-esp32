@@ -20,6 +20,10 @@ pub fn publish_sensor_topic(acc: &str, obj: &str, dev: &str, channel: &str) -> S
     )
 }
 
+pub fn publish_command_response(acc: &str, obj: &str, command: &str) -> String {
+    format!("/ssn/acc/{}/obj/{}/commands/response/{}", acc, obj, command)
+}
+
 // /// String split to vector
 // fn csplit(input: &str, sep: char) -> Vec<String> {
 //     input
@@ -79,7 +83,7 @@ pub fn parse_topic(topic: &str) -> Option<(&str, &str, Vec<&str>)> {
 /// Parse tokens array after parsing topic
 pub fn parse_token_array<'a>(
     root_token: &'a str,
-    sub_tokens: Vec<&'a str>,
+    sub_tokens: &Vec<&'a str>,
 ) -> Option<HashMap<&'a str, &'a str>> {
     log::debug!(
         "parse_token_array. root_token={}, sub_tokens len={}",
