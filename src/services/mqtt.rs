@@ -1,21 +1,70 @@
-//! MQTT client lifecycle: callback dispatch, subscriptions, and the retained start message.
+//! MQTT service: connection parameters, client lifecycle, callback dispatch, and subscriptions.
 
 use anyhow::Result;
 use embedded_svc::mqtt::client::{EventPayload, QoS};
-use esp_idf_svc::mqtt::client::EspMqttClient;
+use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration};
 use std::thread::sleep;
 use std::time::Duration;
 
-use crate::mqtt_commands;
-use crate::mqtt_config::MqttConfig;
-use crate::mqtt_messages;
-use crate::settings::{Config, Settings};
-use crate::shared_state::{
+use crate::app::state::{
     get_sensor_values, SharedSensorData, SharedSsnDeviceCommand, SharedSsnMqttCommand,
 };
+use crate::protocol::commands;
+use crate::protocol::topics;
+use crate::services::config::{Config, Settings};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const RECONNECT_DELAY_MS: u64 = 5000;
+
+/// Broker URL, client ID and subscription list.
+///
+/// The `MqttClientConfiguration` itself is intentionally not stored here: it borrows the client
+/// ID, so it is built at the call site where the client is created.
+pub struct MqttConfig {
+    pub broker_url: String,
+    pub client_id: String,
+    pub topics: Vec<String>,
+}
+
+impl MqttConfig {
+    pub fn from_app_config(app_config: &Config) -> Self {
+        let broker_url = if !app_config.mqtt_user.is_empty() {
+            format!(
+                "mqtt://{}:{}@{}",
+                app_config.mqtt_user, app_config.mqtt_pass, app_config.mqtt_host
+            )
+        } else {
+            format!("mqtt://{}", app_config.mqtt_host)
+        };
+
+        let client_id = app_config.mqtt_client_id.clone();
+        let topics = vec![
+            format!("/ssn/acc/{}/raw_data", &app_config.account),
+            format!(
+                "/ssn/acc/{}/obj/{}/commands/+",
+                &app_config.account, &app_config.object
+            ),
+            format!(
+                "/ssn/acc/{}/obj/{}/commands/device/+/+/in",
+                &app_config.account, &app_config.object
+            ),
+        ];
+
+        Self {
+            broker_url,
+            client_id,
+            topics,
+        }
+    }
+
+    /// Build the esp-idf client configuration for this connection.
+    pub fn client_configuration<'a>(&'a self) -> MqttClientConfiguration<'a> {
+        MqttClientConfiguration {
+            client_id: Some(self.client_id.as_str()),
+            ..Default::default()
+        }
+    }
+}
 
 /// Create the MQTT client, subscribe to the command topics, and publish `status/start`.
 ///
@@ -49,7 +98,7 @@ pub fn start(
                 EventPayload::Received { data, topic, .. } => {
                     log::info!("Received message on {:?}: {:?}", topic, data);
                     if let Some(topic) = topic {
-                        mqtt_commands::handle_message(
+                        if let Err(e) = commands::handle_message(
                             topic,
                             data,
                             &account_ref,
@@ -57,7 +106,9 @@ pub fn start(
                             &mut settings,
                             &device_commands,
                             &publish_commands,
-                        );
+                        ) {
+                            log::warn!("Ignoring MQTT command on {}: {}", topic, e);
+                        }
                     }
 
                     if let Some(vals) = get_sensor_values(&shared_data, "aht21-test") {
@@ -102,7 +153,7 @@ pub fn start(
 
     // publish start message
     client.enqueue(
-        &mqtt_messages::status_topic(&account, &object, "start"),
+        &topics::status_topic(&account, &object, "start"),
         QoS::AtLeastOnce,
         true,
         mqtt_config.client_id.as_bytes(),

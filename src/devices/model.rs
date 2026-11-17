@@ -12,12 +12,12 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::adc_reader::AdcReaderTrait;
-use crate::aht21::AHT21Sensor;
-use crate::bmp;
-use crate::bmp180::BMP180Sensor;
-use crate::ens160::ENS160Sensor;
-use crate::shared_state::SharedI2c;
+use crate::drivers::adc::AdcReaderTrait;
+use crate::drivers::aht21::AHT21Sensor;
+use crate::drivers::bmp;
+use crate::drivers::bmp180::BMP180Sensor;
+use crate::drivers::ens160::ENS160Sensor;
+use crate::platform::i2c::SharedI2c;
 
 pub enum SsnSensorPeriod {
     Fast,
@@ -169,10 +169,13 @@ impl<T: Pin + InputPin + OutputPin> PinDriverBasicInput for PinDriver<'static, T
             PinDriver::subscribe(self, move || {
                 // NOTE: this takes a mutex in ISR context; known debt (`ARCHITECTURE.md` §19
                 // item 14). Keep the ISR body minimal.
-                crate::interrupts::record_interrupt(pin_number as usize);
+                crate::platform::interrupts::record_interrupt(pin_number as usize);
 
-                // Notify the main task
-                notifier.notify_and_yield(NonZeroU32::new(pin_number).unwrap());
+                // Notify the main task. `notify_and_yield` needs a `NonZeroU32`; pin 0 cannot be
+                // encoded, so skip the notification (the counters above are still updated).
+                if let Some(pin) = NonZeroU32::new(pin_number) {
+                    notifier.notify_and_yield(pin);
+                }
             })
         }
     }
@@ -234,7 +237,7 @@ impl<'a> SsnDevice<'a> {
     ) -> Option<SharedSsnDevice<'b>> {
         devices
             .iter()
-            .find(|d| d.lock().unwrap().dev_id == dev_id)
+            .find(|d| crate::platform::lock_recover(d).dev_id == dev_id)
             .map(Arc::clone)
     }
 

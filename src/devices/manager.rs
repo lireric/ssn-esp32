@@ -1,20 +1,20 @@
 //! Device sampling and publishing.
 //!
 //! This is the single device-processing path, moved out of `main.rs`. It preserves the original
-//! inline behavior exactly: one pass over the registered devices, each sampled when the scheduler
-//! fires, with a 500 ms pause after every measured device.
+//! inline behavior: one pass over the registered devices, each sampled when the scheduler fires,
+//! with a 500 ms pause after every measured device. Read failures are logged and skipped instead
+//! of panicking (`ARCHITECTURE.md` §17).
 
-use anyhow::Context;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_svc::mqtt::client::EspMqttClient;
 use std::time::{Duration, Instant};
 
-use crate::interrupts;
-use crate::mqtt_messages;
-use crate::shared_state::{update_sensor_data, SharedSensorData};
-use crate::ssndevices::{SharedSsnDevice, SsnDevices};
-use crate::time_manager::TimeManager;
-use crate::utils::{calculate_percentage_change, handle_sensor_value_update};
+use crate::app::publish::{calculate_percentage_change, handle_sensor_value_update};
+use crate::app::state::{update_sensor_data, SharedSensorData};
+use crate::devices::model::{SharedSsnDevice, SsnDevices};
+use crate::devices::scheduler::TimeManager;
+use crate::platform::interrupts;
+use crate::protocol::topics;
 
 /// If a sensor value has not changed in this period, publish it anyway (seconds).
 pub const MAX_PERIOD_REFRESH_MQTT: u64 = 60;
@@ -58,7 +58,8 @@ impl<'a> DeviceManager<'a> {
         let client = &mut *ctx.client;
 
         for device in &self.devices {
-            let mut cur_device = device.lock().unwrap(); // Blocks until lock acquired
+            // Recover from a poisoned device lock instead of panicking in the sampling path.
+            let mut cur_device = crate::platform::lock_recover(device);
             let dev = cur_device.dev_id.to_string();
 
             // check measure or not in this circle:
@@ -75,7 +76,14 @@ impl<'a> DeviceManager<'a> {
                         voltage_value_last_sent_value,
                         ..
                     } => {
-                        let (new_raw, new_voltage) = sensor.read().unwrap();
+                        // Degraded mode: on a read error keep the last values and retry next cycle.
+                        let (new_raw, new_voltage) = match sensor.read() {
+                            Ok(values) => values,
+                            Err(e) => {
+                                log::error!("adc read failed on device {}: {:?}", dev, e);
+                                continue;
+                            }
+                        };
 
                         // Calculate percentage changes
                         let raw_change_pct =
@@ -105,7 +113,7 @@ impl<'a> DeviceManager<'a> {
                             delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "0"),
+                            &topics::publish_sensor_topic(account, object, &dev, "0"),
                             "adc-voltage",
                         );
                         // Handle raw update
@@ -119,7 +127,7 @@ impl<'a> DeviceManager<'a> {
                             delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "1"),
+                            &topics::publish_sensor_topic(account, object, &dev, "1"),
                             "adc-raw",
                         );
                         let _ = update_sensor_data(
@@ -150,10 +158,14 @@ impl<'a> DeviceManager<'a> {
                             altitude
                         );
                         FreeRtos::delay_ms(500);
-                        let (new_temp, new_pressure, new_alt) = sensor
-                            .get_data()
-                            .context("bmp180 read data error")
-                            .unwrap();
+                        // Degraded mode: on a read error keep the last values and retry next cycle.
+                        let (new_temp, new_pressure, new_alt) = match sensor.get_data() {
+                            Ok(values) => values,
+                            Err(e) => {
+                                log::error!("bmp180 read failed on device {}: {:?}", dev, e);
+                                continue;
+                            }
+                        };
 
                         // Calculate percentage changes
                         let temp_change_pct =
@@ -188,7 +200,7 @@ impl<'a> DeviceManager<'a> {
                             temperature_delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "0"),
+                            &topics::publish_sensor_topic(account, object, &dev, "0"),
                             "bmp180-temperature",
                         );
 
@@ -203,7 +215,7 @@ impl<'a> DeviceManager<'a> {
                             pressure_delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "1"),
+                            &topics::publish_sensor_topic(account, object, &dev, "1"),
                             "bmp180-pressure",
                         );
                         let _ = update_sensor_data(
@@ -243,8 +255,7 @@ impl<'a> DeviceManager<'a> {
                             };
                             let mut cur_last_update = match last_update.get(d.0) {
                                 Some(v) => *v,
-                                None => Instant::now()
-                                    - Duration::from_secs(60 * 60 * 24 * 365 * 30),
+                                None => Instant::now(),
                             };
 
                             let _ = handle_sensor_value_update(
@@ -257,9 +268,15 @@ impl<'a> DeviceManager<'a> {
                                 delta_over.as_ref(),
                                 now,
                                 Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                                &mqtt_messages::publish_sensor_topic(account, object, &dev, d.0),
+                                &topics::publish_sensor_topic(account, object, &dev, d.0),
                                 "storeInt",
                             );
+
+                            // Persist the per-key publish bookkeeping so the first-value and
+                            // 60 s refresh rules behave like the other channels.
+                            last_sent_value
+                                .insert(d.0.clone(), cur_last_sent_value.map(|v| v as i32));
+                            last_update.insert(d.0.clone(), cur_last_update);
                         });
                     }
                     SsnDevices::Ens160 {
@@ -282,8 +299,15 @@ impl<'a> DeviceManager<'a> {
                         ..
                     } => {
                         FreeRtos::delay_ms(500);
-                        let (new_co2eq, new_tvoc, new_aqi) =
-                            sensor.get_data().unwrap_or((-1, -1, -1));
+                        // Degraded mode: ENS160 keeps publishing the invalid sentinel tuple when a
+                        // read fails; the error is logged. (Documented in ARCHITECTURE.md §17.)
+                        let (new_co2eq, new_tvoc, new_aqi) = match sensor.get_data() {
+                            Ok(values) => values,
+                            Err(e) => {
+                                log::error!("ens160 read failed on device {}: {:?}", dev, e);
+                                (-1, -1, -1)
+                            }
+                        };
 
                         // Calculate percentage changes
                         let co2eq_change_pct =
@@ -319,7 +343,7 @@ impl<'a> DeviceManager<'a> {
                             co2eq_delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "0"),
+                            &topics::publish_sensor_topic(account, object, &dev, "0"),
                             "Ens160-co2eq",
                         );
                         // Handle tvoc update
@@ -333,7 +357,7 @@ impl<'a> DeviceManager<'a> {
                             tvoc_delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "1"),
+                            &topics::publish_sensor_topic(account, object, &dev, "1"),
                             "Ens160-tvoc",
                         );
                         // Handle aqi update
@@ -347,7 +371,7 @@ impl<'a> DeviceManager<'a> {
                             aqi_delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "2"),
+                            &topics::publish_sensor_topic(account, object, &dev, "2"),
                             "Ens160-aqi",
                         );
                         let _ = update_sensor_data(
@@ -376,7 +400,14 @@ impl<'a> DeviceManager<'a> {
                         );
 
                         // Read sensor data with error handling
-                        let (new_temp, new_humidity) = sensor.get_data().unwrap();
+                        // Degraded mode: on a read error keep the last values and retry next cycle.
+                        let (new_temp, new_humidity) = match sensor.get_data() {
+                            Ok(values) => values,
+                            Err(e) => {
+                                log::error!("aht21 read failed on device {}: {:?}", dev, e);
+                                continue;
+                            }
+                        };
 
                         // Calculate percentage changes
                         let temperature_change_pct =
@@ -406,7 +437,7 @@ impl<'a> DeviceManager<'a> {
                             temperature_delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "0"),
+                            &topics::publish_sensor_topic(account, object, &dev, "0"),
                             "aht21-temperature",
                         );
                         let _ = handle_sensor_value_update(
@@ -419,7 +450,7 @@ impl<'a> DeviceManager<'a> {
                             humidity_delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "1"),
+                            &topics::publish_sensor_topic(account, object, &dev, "1"),
                             "aht21-humidity",
                         );
                         let _ = update_sensor_data(
@@ -443,7 +474,13 @@ impl<'a> DeviceManager<'a> {
                             log::info!("set value {}", command_value);
                             *data = command_value as u8;
                         };
-                        let current_pin = sensor.get_pin().unwrap() as u32;
+                        let current_pin = match sensor.get_pin() {
+                            Ok(pin) => pin as u32,
+                            Err(e) => {
+                                log::error!("gpio get_pin failed on device {}: {:?}", dev, e);
+                                continue;
+                            }
+                        };
                         let old_counter = *counter;
 
                         if pin_num == Some(current_pin) {
@@ -453,9 +490,17 @@ impl<'a> DeviceManager<'a> {
                                 "Interrupt pin = {:?} current_pin: {}",
                                 pin_num, current_pin
                             );
-                            let _ = sensor.enable_interrupt();
+                            if let Err(e) = sensor.enable_interrupt() {
+                                log::warn!("gpio re-enable interrupt failed on {}: {:?}", dev, e);
+                            }
                         };
-                        let new_data = sensor.get_value().unwrap() as u8;
+                        let new_data = match sensor.get_value() {
+                            Ok(value) => value as u8,
+                            Err(e) => {
+                                log::error!("gpio read failed on device {}: {:?}", dev, e);
+                                continue;
+                            }
+                        };
                         let data_change_pct =
                             calculate_percentage_change(new_data as f32, *data as u8 as f32);
                         let counter_change_pct = calculate_percentage_change(
@@ -473,23 +518,25 @@ impl<'a> DeviceManager<'a> {
                             delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "0"),
+                            &topics::publish_sensor_topic(account, object, &dev, "0"),
                             "gpio-in",
                         );
                         *data = new_data;
+                        let mut last_sent_counter_f64 = last_sent_counter.map(|v| v as f64);
                         let _ = handle_sensor_value_update(
                             client,
                             *counter as f64,
-                            &mut last_sent_counter.map(|v| v as f64),
+                            &mut last_sent_counter_f64,
                             last_update,
                             counter_change_pct,
                             delta,
                             delta_over.as_ref(),
                             now,
                             Duration::from_secs(MAX_PERIOD_REFRESH_MQTT),
-                            &mqtt_messages::publish_sensor_topic(account, object, &dev, "1"),
+                            &topics::publish_sensor_topic(account, object, &dev, "1"),
                             "gpio-in-counter",
                         );
+                        *last_sent_counter = last_sent_counter_f64.map(|v| v as u32);
                         let _ = update_sensor_data(
                             &shared_data,
                             dev,
@@ -499,17 +546,26 @@ impl<'a> DeviceManager<'a> {
                     SsnDevices::GpioOutput { data, sensor, .. } => {
                         if dev.eq(command_dev_id) {
                             log::info!("set value StoreInt {}", command_value);
-                            if command_value != 0.0 {
-                                let _ = sensor.set_high();
+                            let result = if command_value != 0.0 {
                                 *data = true;
+                                sensor.set_high()
                             } else {
-                                let _ = sensor.set_low();
                                 *data = false;
+                                sensor.set_low()
                             };
+                            if let Err(e) = result {
+                                log::error!("gpio write failed on device {}: {:?}", dev, e);
+                            }
                         };
                     }
-                    // KNOWN DEBT: enabling BMP280/BME280 panics here (`ARCHITECTURE.md` §19 item 16).
-                    SsnDevices::Bmp { .. } => todo!(),
+                    // KNOWN DEBT: the BMP280/BME280 processing path is not implemented. Degrade by
+                    // logging and skipping the device instead of panicking (`ARCHITECTURE.md` §17).
+                    SsnDevices::Bmp { .. } => {
+                        log::error!(
+                            "device {} uses the unimplemented Bmp variant; skipping",
+                            dev
+                        );
+                    }
                 }
                 // little pause between measurments
                 FreeRtos::delay_ms(500); // Wait 500ms

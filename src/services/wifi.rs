@@ -20,7 +20,7 @@ pub fn connect_wifi(
     const MAX_RETRIES: u8 = 5;
     let ssid = wifi
         .get_configuration()
-        .unwrap()
+        .map_err(|e| anyhow::anyhow!("failed to read WiFi configuration: {:?}", e))?
         .as_mixed_conf_mut()
         .0
         .ssid
@@ -157,15 +157,23 @@ pub fn wifi<'a>(
 
     wifi.set_configuration(&Configuration::Mixed(
         ClientConfiguration {
-            ssid: ssid.try_into().expect("err"),
-            password: pass.try_into().expect("err"),
+            ssid: ssid
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("WiFi SSID too long (max 32 bytes)"))?,
+            password: pass
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("WiFi password too long (max 64 bytes)"))?,
             channel,
             auth_method,
             ..Default::default()
         },
         AccessPointConfiguration {
-            ssid: ssn_wifi_ssid.try_into().expect("err"), //"ssn".try_into().expect("err"),
-            password: ssn_wifi_pass.try_into().expect("err"), //"ssn123456".try_into().expect("err"),
+            ssid: ssn_wifi_ssid
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("AP SSID too long (max 32 bytes)"))?,
+            password: ssn_wifi_pass
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("AP password too long (max 64 bytes)"))?,
             channel: channel.unwrap_or(1),
             ..Default::default()
         },

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-> **Status: DRAFT (2026-11-16)**
+> **Status: DRAFT (2026-11-17)**
 > This file is derived from `ARCHITECTURE.md` and describes the repository **as it currently
 > behaves**, including known technical debt. It is guidance for coding agents, not a promise
 > that the current design is correct. Read `ARCHITECTURE.md` before non-trivial changes, and
@@ -78,28 +78,28 @@ style. Do not run a repo-wide reformat as part of a focused change.
 
 | Path | Use it for |
 |---|---|
-| `src/main.rs` | Entry point, initialization order, main-loop orchestration (~320 lines) |
-| `src/shared_state.rs` | Shared aliases, command queues + helpers, sensor-data store, `SharedI2c` |
-| `src/config_service.rs` | NVS open, reset path, config load, MAC identity overrides |
-| `src/alarms.rs` | Alarm store and `check_alarms` transitions |
-| `src/interrupts.rs` | GPIO interrupt counters and helpers |
-| `src/led.rs` | WS2812 status LED |
-| `src/mqtt_service.rs` | MQTT client creation, callback dispatch, subscriptions, start message |
-| `src/mqtt_commands.rs` | Inbound command parsing and queueing |
-| `src/mqtt_config.rs` | Broker URL, client ID, topic list, client configuration |
-| `src/device_registration.rs` | **Hardcoded** device set (GPIO, ENS160, BMP180) |
-| `src/device_manager.rs` | **Single** device sampling/publishing path for every variant |
-| `src/time_manager.rs` | Fast/Middle/Slow sampling scheduler |
-| `src/http_server.rs` | `/` and `/settings` handlers and HTML templates |
-| `src/ssndevices.rs` | `SsnDevice` / `SsnDevices` model, sampling periods, GPIO traits + `PinDriverBasicInput` impl, `DeviceType` / `DeviceConfig` |
-| `src/settings.rs` | `Config` schema, NVS load/save/defaults, HTML rendering |
-| `src/mqtt_messages.rs` | MQTT topic builders and topic/token parsers |
-| `src/utils.rs` | `handle_sensor_value_update` publish policy and percentage-change helper |
-| `src/ssn_wifi.rs` | STA+AP setup, connect/retry, connection check |
-| `src/bmp180.rs`, `src/ens160.rs`, `src/aht21.rs` | I2C sensor adapters |
-| `src/adc_reader.rs` | ADC1 adapter |
-| `src/bmp.rs` | BMP280/BME280 adapter |
-| `src/helpers.rs` | **Scaffold** — extracted MQTT/alarm/GPIO/LED helpers, not called by the loop |
+| `src/main.rs` | Entry point, module wiring, reboot loop (~34 lines) |
+| `src/app/mod.rs` | Initialization order and main loop |
+| `src/app/state.rs` | Shared aliases, command queues + helpers, sensor-data store |
+| `src/app/publish.rs` | Publish policy and percentage-change helper |
+| `src/app/helpers.rs` | **Scaffold** — extracted MQTT/alarm/GPIO/LED helpers, not called by the loop |
+| `src/devices/model.rs` | `SsnDevice` / `SsnDevices` model, periods, GPIO traits + `PinDriverBasicInput` impl, `DeviceType` / `DeviceConfig` |
+| `src/devices/registration.rs` | **Hardcoded** device set (GPIO, ENS160, BMP180) |
+| `src/devices/manager.rs` | **Single** device sampling/publishing path for every variant; degraded read modes |
+| `src/devices/scheduler.rs` | Fast/Middle/Slow sampling scheduler |
+| `src/drivers/bmp180.rs`, `aht21.rs`, `bmp.rs`, `ens160.rs` | I2C sensor adapters |
+| `src/drivers/adc.rs` | ADC1 adapter |
+| `src/protocol/topics.rs` | MQTT topic builders and topic/token parsers |
+| `src/protocol/commands.rs` | Inbound command parser (`CommandError`) and queueing |
+| `src/services/config.rs` | `Config` schema, NVS load/save/defaults, HTML rendering, reset path, identity overrides |
+| `src/services/wifi.rs` | STA+AP setup, connect/retry, connection check |
+| `src/services/mqtt.rs` | Broker/client configuration, MQTT client, callback dispatch, subscriptions, start message |
+| `src/services/http.rs` | `/` and `/settings` handlers and HTML templates |
+| `src/services/alarms.rs` | Alarm store and `check_alarms` transitions |
+| `src/services/led.rs` | `Colors` and WS2812 status LED |
+| `src/platform/i2c.rs` | `SharedI2c` adapter |
+| `src/platform/interrupts.rs` | GPIO interrupt counters and helpers |
+| `src/platform/mod.rs` | `lock_recover` mutex-poisoning recovery |
 | `ARCHITECTURE.md` | Source of truth for current architecture and known gaps |
 | `docs/README.md` | Build/flash/dev-container template (not architecture-specific) |
 | `docs/diagram.mmd` | Older Mermaid overview; prefer `ARCHITECTURE.md` diagrams |
@@ -110,15 +110,14 @@ style. Do not run a repo-wide reformat as part of a focused change.
 
 ### Runtime and device processing
 
-- `main()` loops on `main_logic()`; errors propagate, then `esp_restart()`.
+- `main()` loops on `app::run()`; errors propagate, then `esp_restart()`.
 - The main loop processes **one MQTT publish command** and **one device command** per
   iteration. Both queues use `Vec::pop()` — **LIFO**.
-- Device processing lives in `DeviceManager::process_all_devices` (`device_manager.rs`), not in
-  `main.rs`. `TimeManager`, `MqttConfig`, `mqtt_service`, `http_server`, and `config_service` are
-  wired; only `helpers.rs` remains a scaffold.
+- Device processing lives in `DeviceManager::process_all_devices` (`devices/manager.rs`), not in
+  `app/mod.rs`. Only `app/helpers.rs` remains a scaffold.
 - `DeviceManager` is the **only** device-processing path and covers every `SsnDevices` variant.
-  Do not reintroduce an inline match in `main.rs` or a second implementation.
-- Devices are registered **hardcoded** in `device_registration.rs`:
+  Do not reintroduce an inline match in `app/mod.rs` or a second implementation.
+- Devices are registered **hardcoded** in `devices/registration.rs`:
   - GPIO outputs `gpio-out3/4/5` (GPIO3/4/5);
   - GPIO input `gpio-in6` (GPIO6, any-edge, pull-up);
   - ENS160 `ens160-test` and BMP180 `bmp180` when initialization succeeds.
@@ -126,10 +125,13 @@ style. Do not run a repo-wide reformat as part of a focused change.
 - `Config.devices` is parsed but **never used** to create devices.
 - `is_active` and `is_paused` are stored but **never checked**. Every registered device is
   processed according to its period.
+- Sensor read and MQTT parse failures are **degraded, not fatal**: see `ARCHITECTURE.md` §17.
+  Do not add `unwrap()`/`todo!()` to these paths.
 
 ### Sampling and publishing
 
 - `Fast` = every loop; `Middle` ≈ 20 s; `Slow` ≈ 60 s. Counters reset at the end of a loop.
+- A channel with `last_sent_value == None` publishes on its first sample after boot.
 - A publish is forced after **60 s** regardless of change (`MAX_PERIOD_REFRESH_MQTT`).
 - `delta` is the minimum **positive** percentage change that triggers an early publish.
 - `delta_over` is a **spike suppressor**: if the change from the last sent value is at or above
@@ -170,7 +172,8 @@ style. Do not run a repo-wide reformat as part of a focused change.
 - Current alarms are test data (2025 dates).
 - GPIO interrupt callback increments atomics and notifies the main task. It currently also
   takes a `std::sync::Mutex` — this is an ISR-safety risk; do not add more locking there.
-- The per-pin interrupt map is a fixed `[AtomicU32; 10]`; interrupt-enabled pins ≥ 10 panic.
+- The per-pin interrupt table is fixed at `MAX_TRACKED_PIN = 10`; higher pins count only in the
+  total (no panic).
 - Only one notification is consumed per loop; counters coalesce.
 
 ### Security and operations
@@ -187,12 +190,11 @@ style. Do not run a repo-wide reformat as part of a focused change.
 
 ### A. Add or change a sensor/device type
 
-1. Add an adapter following the existing `src/*.rs` pattern (constructor + `get_data`-style
-   method, typed error).
-2. Add fields/variant to `SsnDevices` in `src/ssndevices.rs`.
-3. Register the device in `device_registration.rs` (hardcoded; `Config.devices` is still unused).
-4. Add the match arm in `DeviceManager::process_all_devices` (`device_manager.rs`). It is the
-   only device-processing path.
+1. Add an adapter under `src/drivers/` (constructor + `get_data`-style method, typed error).
+2. Add fields/variant to `SsnDevices` in `src/devices/model.rs`.
+3. Register the device in `devices/registration.rs` (hardcoded; `Config.devices` is still unused).
+4. Add the match arm in `DeviceManager::process_all_devices` (`devices/manager.rs`). It is the
+   only device-processing path; return/log a typed error instead of adding a panic.
 5. Keep logical channel indexes stable. Current mappings are documented in `ARCHITECTURE.md`
    §7.3.
 6. If you add `DeviceType`/`DeviceConfig` fields, remember that config-driven creation is not
@@ -201,8 +203,10 @@ style. Do not run a repo-wide reformat as part of a focused change.
 
 ### B. Change publish behavior
 
-- Use `utils::handle_sensor_value_update` for sensor values; do not hand-roll `client.enqueue`
-  except for status/response messages.
+- Use `app::publish::handle_sensor_value_update` for sensor values; do not hand-roll
+  `client.enqueue` except for status/response messages.
+- First-sample publishing is keyed on `last_sent_value == None`; preserve that when adding
+  channels.
 - Do not change `delta`/`delta_over` semantics without confirming with maintainers; the
   backend may rely on the current cadence and filtering.
 - Changing payloads from scalar text (for example, to JSON) is a **breaking protocol change**.
@@ -213,20 +217,21 @@ style. Do not run a repo-wide reformat as part of a focused change.
 
 ### C. Add an MQTT command or topic
 
-1. Add the builder/parser in `src/mqtt_messages.rs`; do not scatter topic strings.
-2. In `mqtt_commands::handle_message`, only parse, validate, and enqueue. Do not block the
+1. Add the builder/parser in `src/protocol/topics.rs`; do not scatter topic strings.
+2. In `protocol::commands::handle_message`, only parse, validate, and enqueue. Do not block the
    callback with sleeps, long NVS work, or sensor reads.
-3. Extend the command queue / `SsnDeviceCommand` if needed, and apply the command in the main
-   loop.
-4. Preserve the account filter.
-5. Avoid `unwrap()` on optional token-map entries; log and ignore malformed messages instead.
+3. Return a `CommandError` variant for new malformed-input cases; never `unwrap()` or panic on
+   subscriber input.
+4. Extend the command queue / `SsnDeviceCommand` if needed, and apply the command in the main
+   loop or `DeviceManager`.
+5. Preserve the account filter.
 6. Update the topic table in `ARCHITECTURE.md` §12.3 and any open questions.
 
 ### D. Change configuration
 
 - Update `Config`, its `Default`, and serde derives together. Keep JSON round-tripping.
 - The 1 KB read buffer is a hard limit today. If configuration can grow, update the buffer in
-  `src/settings.rs` and verify the failure path.
+  `src/services/config.rs` and verify the failure path.
 - Do not add credentials to defaults, test JSON, examples, or logs.
 - If you touch the reset path, remove or feature-gate the hardcoded test configuration rather
   than extending it.
@@ -241,7 +246,8 @@ style. Do not run a repo-wide reformat as part of a focused change.
   the commented ADC example; do not enable both.
 - Keep the ISR callback minimal: no mutexes, allocation, logging, or blocking calls. Use
   atomics and `Notification`.
-- Fix the fixed-size per-pin array before enabling interrupts on pins ≥ 10.
+- Per-pin counters only cover pins `< MAX_TRACKED_PIN` (10); out-of-range pins are counted only
+  in the total. Increase the constant in `platform/interrupts.rs` if a pin needs a per-pin count.
 - Remember `notification.wait(0)` consumes at most one notification per main-loop iteration.
 - Keep `PinDriverBasicInput` / `PinDriverTraitOutput` implementations object-safe.
 
@@ -250,10 +256,11 @@ style. Do not run a repo-wide reformat as part of a focused change.
 - Do it incrementally, one behavior at a time, preserving external behavior.
 - Move pure logic first (topic parsing, publish policy, alarm transitions) so it can be tested.
 - `DeviceManager::process_all_devices` is the single device-processing path. Add new sampling
-  there; do not reintroduce an inline match in `main.rs`.
+  there; do not reintroduce an inline match in `app/mod.rs`.
 - `TimeManager` only resets counters in `reset_if_needed()` at the end of an iteration; keep
   that timing if you touch the scheduler.
-- Keep `main.rs` as the composition root and leave service wiring in its own modules.
+- Keep `main.rs` as entry/wiring and `app/mod.rs` as lifecycle/composition; put service details
+  in their own modules.
 
 ### G. Dependencies
 
@@ -282,14 +289,19 @@ style. Do not run a repo-wide reformat as part of a focused change.
 ## 8. Error handling rules
 
 - Initialization: use `anyhow::Result`, `?`, and `.context(...)`.
-- Sensor reads: do not add new panics. Return a typed error or log and skip the cycle.
-- `todo!()` is not acceptable in a reachable path. If you touch one, replace it.
-- `main_logic` errors reboot the device. Startup errors are fatal; sensor initialization errors
+- Sensor reads: log the typed error and skip the cycle; never add `unwrap()`/`panic!()`/`todo!()`.
+  Keep the previous values so the next period retries.
+- MQTT parsing: return a `protocol::commands::CommandError`; the MQTT service logs it and drops
+  the message. Never panic on subscriber input.
+- Shared locks: use `platform::lock_recover` (or the same recovery pattern) instead of
+  `lock().unwrap()` in runtime paths.
+- `app::run` errors reboot the device. Startup errors are fatal; sensor initialization errors
   are non-fatal by design.
 - `get_config()` currently falls back to defaults on any failure. If you change this, preserve
   a clear diagnostic and avoid silently overwriting valid configuration.
 - If you change MQTT publish error handling, be explicit about whether failures are logged,
   retried, or propagated.
+- Keep `ARCHITECTURE.md` §17 ("Degraded modes") in sync when you add or change a failure path.
 
 ---
 
@@ -330,17 +342,19 @@ Run or confirm the following before finishing:
 
 | Trap | What to know |
 |---|---|
-| `SsnDevices::Bmp` | The match arm is `todo!()`; do not enable BMP280/BME280 without implementing it |
-| Non-numeric MQTT channel | Parser currently hits `todo!()`; malformed input can panic |
-| `unwrap()` paths | BMP180, AHT21, and ADC read paths panic on failure; replace when touched |
+| `SsnDevices::Bmp` | The arm logs an error and skips the device; BMP280/BME280 processing is still unimplemented |
+| Degraded sensor reads | Read failures are logged and skipped; previous values are retained, so a fault can look like stale data until the next successful read |
+| Degraded MQTT parsing | Malformed topics/payloads are dropped with a warning (`CommandError`), not acknowledged |
+| Mutex recovery | `platform::lock_recover` recovers poisoned locks; contents after a panic may be inconsistent |
 | `get_config` fallback | Any error, including a >1 KB blob, silently writes defaults |
 | `Config::Display` | Renders HTML and is used by the MQTT `get` response |
 | `Config` debug log | `Debug` prints passwords; `Display` masks them |
 | `is_active` / `is_paused` | Stored but ignored; devices cannot be disabled remotely |
-| `Config.devices` | Parsed but ignored; registration is hardcoded in `device_registration.rs` |
+| `Config.devices` | Parsed but ignored; registration is hardcoded in `devices/registration.rs` |
 | GPIO command semantics | `GpioInput` command value is overwritten by the pin read; `GpioOutput` ignores the channel |
+| Interrupt pin range | Per-pin counters only cover pins `< MAX_TRACKED_PIN` (10); higher pins count only in the total |
 | Flash scripts | `scripts/flash.sh` uses `web-flash`; `flash_riscv32imc.sh` uses `espflash` |
-| Scaffold module | `helpers.rs` is compiled but not called by the loop |
+| Scaffold module | `app/helpers.rs` is compiled but not called by the loop |
 | Generated trees | `target/` and `.embuild/` are build artifacts; never edit them |
 
 ---
@@ -376,5 +390,5 @@ Do not guess on these; ask or leave the current behavior intact and document the
 
 ---
 
-*End of draft. This file reflects the repository as of 2026-11-16 and should be revised when
+*End of draft. This file reflects the repository as of 2026-11-17 and should be revised when
 the architecture or working agreements change.*

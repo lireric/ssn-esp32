@@ -1,16 +1,9 @@
-use embedded_svc::mqtt::client::Client;
-use embedded_svc::mqtt::client::{
-    Details::Complete, EventPayload::Error, EventPayload::Received, QoS,
-};
-use esp_idf_hal::adc::ADC1;
-use esp_idf_hal::gpio::ADCPin;
-use std::fmt::{Debug, Display};
+use embedded_svc::mqtt::client::{Client, QoS};
 use std::time::{Duration, Instant};
 
-use crate::shared_state::{update_sensor_data, SharedSensorData};
-use crate::ssndevices::{SsnChannelInfo, SsnDevice, SsnDevices};
-
-// use crate::mqtt_messages;
+// The commented-out channel helpers below would use:
+// use crate::app::state::update_sensor_data;
+// use crate::devices::model::{SsnChannelInfo, SsnDevice, SsnDevices};
 
 // Helper function to calculate percentage change
 pub fn calculate_percentage_change(current: f32, previous: f32) -> f32 {
@@ -21,7 +14,10 @@ pub fn calculate_percentage_change(current: f32, previous: f32) -> f32 {
     }
 }
 
-// Function to handle MQTT sending logic for a sensor value
+// Function to handle MQTT sending logic for a sensor value.
+//
+// A channel that has never been published (`last_sent_value == None`) is sent immediately, which
+// is what the old "timestamp 30 years in the past" initialization was trying to express.
 pub fn handle_sensor_value_update<T, U: Client>(
     client: &mut U,
     current_value: T,
@@ -40,7 +36,8 @@ where
     U: embedded_svc::mqtt::client::Enqueue,
 {
     let current_value_f32 = current_value.into() as f32;
-    if change_pct >= *delta_threshold || last_update.elapsed() > max_refresh_period {
+    let is_first_value = last_sent_value.is_none();
+    if is_first_value || change_pct >= *delta_threshold || last_update.elapsed() > max_refresh_period {
         let last_sent_value_tmp = last_sent_value.unwrap_or(current_value); // first time check
 
         if let Some(threshold) = delta_over_threshold {

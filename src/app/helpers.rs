@@ -1,8 +1,9 @@
 //! Extracted MQTT-command / alarm / GPIO-notification / LED helpers.
 //!
 //! SCAFFOLD: these helpers are compiled but not called by the main loop yet. The main loop
-//! currently uses `alarms`, `shared_state`, `interrupts`, and `led` directly. Keep this module in
-//! sync if the loop is migrated to it (`ARCHITECTURE.md` §19 item 2).
+//! currently uses `services::alarms`, `app::state`, `platform::interrupts`, and `services::led`
+//! directly. Keep this module in sync if the loop is migrated to it (`ARCHITECTURE.md` §19
+//! item 2).
 
 use anyhow::Result;
 use embedded_svc::mqtt::client::QoS;
@@ -11,12 +12,12 @@ use esp_idf_svc::mqtt::client::EspMqttClient;
 use std::sync::Arc;
 use ws2812_esp32_rmt_driver::driver::Ws2812Esp32RmtDriver;
 
-use crate::alarms::check_alarms;
-use crate::commons::Colors;
-use crate::shared_state::{
+use crate::app::state::{
     pop_command, pop_mqtt_command, push_command, SharedSsnDeviceCommand, SharedSsnMqttCommand,
     SsnDeviceCommand,
 };
+use crate::services::alarms::check_alarms;
+use crate::services::led::Colors;
 
 pub fn process_mqtt_commands(
     client: &mut EspMqttClient,
@@ -64,5 +65,5 @@ pub fn get_device_command(commands: &SharedSsnDeviceCommand) -> (String, u8, f32
 }
 
 pub fn update_led_status(ws2812: &mut Ws2812Esp32RmtDriver, color: Colors) {
-    crate::led::status_led(ws2812, color);
+    crate::services::led::status_led(ws2812, color);
 }

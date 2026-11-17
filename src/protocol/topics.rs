@@ -6,8 +6,6 @@ use std::{
     collections::HashMap,
     str,
 };
-// mod commons;
-use crate::commons::ValuesDev;
 
 pub fn status_topic(acc: &str, obj: &str, event: &str) -> String {
     format!("/ssn/acc/{}/obj/{}/status/{}", acc, obj, event)

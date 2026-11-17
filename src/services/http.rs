@@ -6,7 +6,7 @@ use embedded_svc::io::Write;
 use esp_idf_svc::hal::io::EspIOError;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 
-use crate::settings::Config;
+use crate::services::config::Config;
 
 /// Start the HTTP server on the default port (80).
 ///

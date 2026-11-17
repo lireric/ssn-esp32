@@ -8,16 +8,17 @@ use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{InputPin, InterruptType, OutputPin, Pin, PinDriver, Pull};
 use esp_idf_hal::task::notification::Notification;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::bmp180::BMP180Sensor;
-use crate::ens160::ENS160Sensor;
-use crate::shared_state::SharedI2c;
-use crate::ssndevices::{SharedSsnDevice, SsnDevice, SsnDevices, SsnSensorPeriod};
+use crate::drivers::bmp180::BMP180Sensor;
+use crate::drivers::ens160::ENS160Sensor;
+use crate::devices::model::{SharedSsnDevice, SsnDevice, SsnDevices, SsnSensorPeriod};
+use crate::platform::i2c::SharedI2c;
 
-/// Sensors start with "never measured" timestamps so the first cycle always publishes.
+/// Sensors start with "never sent" values, so the first sample is published immediately; the
+/// timestamps only anchor the periodic refresh.
 fn initial_instant() -> Instant {
-    Instant::now() - Duration::from_secs(60 * 60 * 24 * 365 * 30)
+    Instant::now()
 }
 
 /// Register the GPIO outputs (3/4/5) and the GPIO input (6).

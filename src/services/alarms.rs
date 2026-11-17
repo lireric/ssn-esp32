@@ -30,7 +30,7 @@ pub fn add_alarm(
     inactive_level: u8,
 ) {
     let trigger_time_utc = trigger_time.with_timezone(&Utc);
-    ALARMS.lock().unwrap().push(Alarm {
+    ALARMS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(Alarm {
         trigger_time: trigger_time_utc,
         active_duration_secs: duration_secs,
         dev_id,
@@ -51,7 +51,9 @@ pub fn check_alarms() -> Vec<(String, u8)> {
     let now = Utc::now();
     let current_time = now.time();
 
-    let mut alarms = ALARMS.lock().unwrap();
+    let mut alarms = ALARMS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut actions: Vec<(String, u8)> = Vec::new();
 
     for alarm in alarms.iter_mut() {

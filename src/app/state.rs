@@ -4,8 +4,6 @@
 //! one instance and clone cheap handles into callbacks and services.
 
 use anyhow::Result;
-use embedded_hal::i2c::{ErrorType, I2c};
-use esp_idf_hal::i2c::{I2cDriver, I2cError, Operation};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -18,13 +16,13 @@ pub fn create_shared_data() -> SharedSensorData {
 }
 
 pub fn update_sensor_data(data: &SharedSensorData, dev_id: String, values: Vec<f32>) -> Result<()> {
-    let mut guard = data.lock().unwrap();
+    let mut guard = crate::platform::lock_recover(data);
     guard.insert(dev_id, values);
     Ok(())
 }
 
 pub fn get_sensor_values(data: &SharedSensorData, dev_id: &str) -> Option<Vec<f32>> {
-    let guard = data.lock().unwrap();
+    let guard = crate::platform::lock_recover(data);
     guard.get(dev_id).cloned()
 }
 
@@ -54,7 +52,7 @@ pub fn create_mqtt_commands_array() -> SharedSsnMqttCommand {
 }
 
 pub fn push_command(data: &SharedSsnDeviceCommand, command: SsnDeviceCommand) -> Result<()> {
-    let mut guard = data.lock().unwrap();
+    let mut guard = crate::platform::lock_recover(data);
     log::info!(
         "push_command: dev={}, channel={}, val={}",
         command.dev_id,
@@ -66,12 +64,12 @@ pub fn push_command(data: &SharedSsnDeviceCommand, command: SsnDeviceCommand) ->
 }
 
 pub fn pop_command(data: &SharedSsnDeviceCommand) -> Option<SsnDeviceCommand> {
-    let mut guard = data.lock().unwrap();
+    let mut guard = crate::platform::lock_recover(data);
     guard.pop()
 }
 
 pub fn push_mqtt_command(data: &SharedSsnMqttCommand, command: SsnMqttCommand) -> Result<()> {
-    let mut guard = data.lock().unwrap();
+    let mut guard = crate::platform::lock_recover(data);
     log::info!(
         "push_command: command={}, message={}",
         command.topic,
@@ -82,53 +80,6 @@ pub fn push_mqtt_command(data: &SharedSsnMqttCommand, command: SsnMqttCommand) -
 }
 
 pub fn pop_mqtt_command(data: &SharedSsnMqttCommand) -> Option<SsnMqttCommand> {
-    let mut guard = data.lock().unwrap();
+    let mut guard = crate::platform::lock_recover(data);
     guard.pop()
-}
-
-/// `I2c` handle shared by every sensor adapter.
-#[derive(Clone)]
-pub struct SharedI2c(Arc<Mutex<I2cDriver<'static>>>);
-
-impl SharedI2c {
-    pub fn new(i2c: Arc<Mutex<I2cDriver<'static>>>) -> Self {
-        SharedI2c(i2c)
-    }
-}
-
-impl ErrorType for SharedI2c {
-    type Error = I2cError;
-}
-
-impl I2c for SharedI2c {
-    fn read(&mut self, addr: u8, buffer: &mut [u8]) -> Result<(), Self::Error> {
-        let mut guard = self.0.lock().unwrap();
-        Ok(guard.read(addr, buffer, 1000)?)
-    }
-
-    fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
-        let mut guard = self.0.lock().unwrap();
-        Ok(guard.write(addr, bytes, 1000)?)
-    }
-
-    fn write_read(
-        &mut self,
-        address: u8,
-        write: &[u8],
-        read: &mut [u8],
-    ) -> std::result::Result<(), Self::Error> {
-        self.transaction(
-            address,
-            &mut [Operation::Write(write), Operation::Read(read)],
-        )
-    }
-
-    fn transaction(
-        &mut self,
-        address: u8,
-        operations: &mut [Operation<'_>],
-    ) -> std::result::Result<(), Self::Error> {
-        let mut guard = self.0.lock().unwrap();
-        Ok(guard.transaction(address, operations, 1000)?)
-    }
 }

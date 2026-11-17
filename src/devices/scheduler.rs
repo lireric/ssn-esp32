@@ -4,7 +4,7 @@
 //! matches the original inline scheduler. (An earlier scaffold reset the counter when it fired,
 //! shifting the cadence by one loop.)
 
-use crate::ssndevices::SsnSensorPeriod;
+use crate::devices::model::SsnSensorPeriod;
 use std::time::{Duration, Instant};
 
 pub struct TimeManager {

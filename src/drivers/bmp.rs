@@ -89,11 +89,19 @@ where
     pub fn get_data(&mut self) -> Result<(f64, f64, Option<f64>)> {
         match self.sensor_type {
             SensorType::BMP280 => {
-                let m = self.bmp280.as_mut().unwrap().measure();
+                let sensor = self
+                    .bmp280
+                    .as_mut()
+                    .context("BMP280 sensor not initialized")?;
+                let m = sensor.measure();
                 Ok((m.temperature, m.pressure, None))
             }
             SensorType::BME280 => {
-                let m = self.bme280.as_mut().unwrap().measure();
+                let sensor = self
+                    .bme280
+                    .as_mut()
+                    .context("BME280 sensor not initialized")?;
+                let m = sensor.measure();
                 Ok((m.temperature, m.pressure, Some(m.humidity)))
             }
         }
