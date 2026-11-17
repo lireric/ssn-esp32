@@ -7,7 +7,8 @@ use esp_idf_hal::gpio::ADCPin;
 use std::fmt::{Debug, Display};
 use std::time::{Duration, Instant};
 
-use crate::{update_sensor_data, SharedSensorData, SsnChannelInfo, SsnDevice, SsnDevices};
+use crate::shared_state::{update_sensor_data, SharedSensorData};
+use crate::ssndevices::{SsnChannelInfo, SsnDevice, SsnDevices};
 
 // use crate::mqtt_messages;
 

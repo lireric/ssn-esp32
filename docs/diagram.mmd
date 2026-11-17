@@ -1,0 +1,122 @@
+graph TB
+    %% Main Application Structure
+    subgraph "Main Application (src/main.rs)"
+        MAIN[Main Application Loop]
+        SETTINGS[Settings Management]
+        WIFI[WiFi Management]
+        MQTT[MQTT Client]
+        HTTP[HTTP Server]
+        LED[LED Status Control]
+        
+        MAIN --> SETTINGS
+        MAIN --> WIFI
+        MAIN --> MQTT
+        MAIN --> HTTP
+        MAIN --> LED
+    end
+    
+    %% Sensor Modules
+    subgraph "Sensor Modules"
+        BMP180[BMP180 Sensor<br/>Temperature/Pressure]
+        ENS160[ENS160 Sensor<br/>Air Quality]
+        AHT21[AHT21 Sensor<br/>Temp/Humidity]
+        ADC[ADC Reader]
+        GPIO_IN[GPIO Input]
+        GPIO_OUT[GPIO Output]
+        
+        BMP180 --> I2C_BUS
+        ENS160 --> I2C_BUS
+        AHT21 --> I2C_BUS
+    end
+    
+    %% Device Management
+    subgraph "Device Management (ssndevices)"
+        SSN_DEV[SsnDevice Struct]
+        DEV_TYPES[SsnDevices Enum]
+        SHARED_DEV[Shared Device Management]
+        
+        DEV_TYPES -->|Variants| BMP180
+        DEV_TYPES -->|Variants| ENS160
+        DEV_TYPES -->|Variants| AHT21
+        DEV_TYPES -->|Variants| ADC
+        DEV_TYPES -->|Variants| GPIO_IN
+        DEV_TYPES -->|Variants| GPIO_OUT
+    end
+    
+    %% Communication & Storage
+    subgraph "Communication & Storage"
+        MQTT_MSG[MQTT Message Handler]
+        NVS[NVS Storage]
+        ALARMS[Alarm System]
+        COMMANDS[Command Queue]
+        
+        MQTT --> MQTT_MSG
+        SETTINGS --> NVS
+        MAIN --> ALARMS
+        MAIN --> COMMANDS
+    end
+    
+    %% Hardware Abstraction
+    subgraph "Hardware Abstraction"
+        I2C_BUS[I2C Bus]
+        GPIO[GPIO Pins]
+        ADC_HW[ADC Hardware]
+        RMT[RMT Driver for LEDs]
+        
+        I2C_BUS -->|SharedI2c Wrapper| SHARED_I2C
+        GPIO --> GPIO_IN
+        GPIO --> GPIO_OUT
+        ADC_HW --> ADC
+        RMT --> LED
+    end
+    
+    %% Shared Resources
+    SHARED_I2C[Shared I2C Resource]
+    SHARED_DATA[Shared Sensor Data]
+    NOTIFICATION[Interrupt Notification]
+    
+    %% External Services
+    subgraph "External Services"
+        BROKER[MQTT Broker]
+        NTP_SERVER[NTP Time Sync]
+        WEB_CLIENT[Web Clients]
+        
+        MQTT --> BROKER
+        MAIN --> NTP_SERVER
+        HTTP --> WEB_CLIENT
+    end
+    
+    %% Data Flow
+    SENSORS[Sensors] -->|Read Data| SHARED_DEV
+    SHARED_DEV -->|Process| MAIN
+    MAIN -->|Publish| MQTT
+    MQTT -->|Subscribe| BROKER
+    BROKER -->|Commands| MQTT_MSG
+    MQTT_MSG -->|Queue| COMMANDS
+    COMMANDS -->|Execute| SHARED_DEV
+    
+    %% Configuration Flow
+    WEB_CLIENT -->|HTTP Requests| HTTP
+    HTTP -->|Settings View| SETTINGS
+    SETTINGS -->|Load/Save| NVS
+    
+    %% Time Management
+    NTP_SERVER -->|Sync Time| ALARMS
+    ALARMS -->|Trigger Actions| COMMANDS
+    
+    %% Interrupt Handling
+    GPIO_IN -->|Interrupts| NOTIFICATION
+    NOTIFICATION -->|Notify| MAIN
+    
+    %% Styling
+    classDef main fill:#e1f5fe,stroke:#01579b
+    classDef sensor fill:#f1f8e9,stroke:#33691e
+    classDef comm fill:#fff3e0,stroke:#e65100
+    classDef hw fill:#f3e5f5,stroke:#4a148c
+    classDef shared fill:#e8f5e8,stroke:#1b5e20
+    
+    class MAIN,SETTINGS,WIFI,MQTT,HTTP,LED main
+    class BMP180,ENS160,AHT21,ADC,GPIO_IN,GPIO_OUT sensor
+    class MQTT_MSG,NVS,ALARMS,COMMANDS,BROKER,NTP_SERVER,WEB_CLIENT comm
+    class I2C_BUS,GPIO,ADC_HW,RMT hw
+    class SHARED_I2C,SHARED_DATA,NOTIFICATION,SHARED_DEV shared

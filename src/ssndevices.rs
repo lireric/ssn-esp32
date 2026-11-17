@@ -1,16 +1,14 @@
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{
-    InputOutput, InputPin, InterruptType, Level, OutputPin, Pin, PinDriver, Pull,
+    Input, InputOutput, InputPin, InterruptType, Level, OutputPin, Pin, PinDriver, Pull,
 };
 use esp_idf_hal::task::notification::Notification;
-use esp_idf_sys::{EspError, ESP_OK};
-use lazy_static::lazy_static;
+use esp_idf_sys::EspError;
 use log;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,12 +17,7 @@ use crate::aht21::AHT21Sensor;
 use crate::bmp;
 use crate::bmp180::BMP180Sensor;
 use crate::ens160::ENS160Sensor;
-use crate::SharedI2c;
-
-lazy_static! {
-    static ref INTERRUPT_COUNTER_GPIO: AtomicU32 = AtomicU32::new(0);
-    static ref INTERRUPT_GPIO_HASHMAP: Mutex<Vec<AtomicU32>> = Mutex::new(vec![]);
-}
+use crate::shared_state::SharedI2c;
 
 pub enum SsnSensorPeriod {
     Fast,
@@ -149,6 +142,42 @@ pub trait PinDriverBasicInput: Any + Send {
 impl dyn PinDriverBasicInput {
     pub fn as_any(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+impl<T: Pin + InputPin + OutputPin> PinDriverBasicInput for PinDriver<'static, T, Input> {
+    fn get_pin(&mut self) -> Result<i32, esp_idf_sys::EspError> {
+        Ok(PinDriver::pin(self))
+    }
+    fn get_value(&mut self) -> Result<bool, EspError> {
+        Ok(PinDriver::get_level(self) == Level::High)
+    }
+    fn set_pull(&mut self, pull: Pull) -> Result<(), esp_idf_sys::EspError> {
+        PinDriver::set_pull(self, pull)
+    }
+    fn set_interrupt_type(
+        &mut self,
+        interript_type: InterruptType,
+    ) -> Result<(), esp_idf_sys::EspError> {
+        PinDriver::set_interrupt_type(self, interript_type)
+    }
+    fn subscribe_boxed(&mut self, nf: Arc<Notification>) -> Result<(), EspError> {
+        let notifier = nf.notifier().clone();
+        let pin_number = self.pin() as u32;
+        log::info!("GpioInput subscribe callback for pin {}", pin_number);
+        unsafe {
+            PinDriver::subscribe(self, move || {
+                // NOTE: this takes a mutex in ISR context; known debt (`ARCHITECTURE.md` §19
+                // item 14). Keep the ISR body minimal.
+                crate::interrupts::record_interrupt(pin_number as usize);
+
+                // Notify the main task
+                notifier.notify_and_yield(NonZeroU32::new(pin_number).unwrap());
+            })
+        }
+    }
+    fn enable_interrupt(&mut self) -> Result<(), esp_idf_sys::EspError> {
+        PinDriver::enable_interrupt(self)
     }
 }
 

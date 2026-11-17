@@ -6,6 +6,7 @@ edition = "2021"
 resolver = "2"
 rust-version = "1.77"
 
+
 [[bin]]
 name = "ssn-esp32"
 harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
@@ -23,8 +24,8 @@ default = []
 experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
-log = "0.4.27"
-anyhow      = "1.0.98"
+log = "0.4.29"
+anyhow      = "1.0.102"
 embedded-svc = "=0.28.1"
 esp-idf-svc = { version = "=0.51.0" }
 esp-idf-sys = { version = "0.36.1", features = ["binstart"] }
@@ -34,18 +35,19 @@ toml-cfg      = "=0.2.0"
 # rumqttc = { version ="0.24.0" } # For MQTT communication
 # tokio = { version = "1", features = ["full"] } # For async runtime
 bmp180-driver = "0.1.1"
-serde = { version = "1.0", features = ["derive"] }
+serde-json-core = "0.6.0"
+serde = { version = "1.0.228", features = ["derive"] }
 bincode = { version = "=2.0.1" } # For binary serialization
 smart-leds = "*"
-ws2812-esp32-rmt-driver = { version = "0.12.0", features = ["smart-leds-trait"] }
-serde_json = "1.0"
-regex = "1.5"
+ws2812-esp32-rmt-driver = { version = "0.13.1", features = ["smart-leds-trait"] }
+serde_json = "1.0.149"
+regex = "1.12.3"
 # ens160-aq = "0.2.10"
 lazy_static = "1.4" 
 ens160 = "0.6.1"
 embedded-hal-compat = "0.13.0"
 ahtx0 = "0.1.4"
-chrono = { version = "0.4.41", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 bmpe280 = "0.1.5"
 
 # [dependencies.smart-leds-trait]
@@ -53,6 +55,6 @@ bmpe280 = "0.1.5"
 # version = "0.3"
 
 [build-dependencies]
-embuild = "0.33"
+embuild = "0.33.1"
 [package.metadata.esp-idf]
 target = "esp32c3"
